@@ -35,3 +35,16 @@ def test_backwards_stamp():
     assert not stamp_went_backwards(10 * S, 11 * S)
     assert not stamp_went_backwards(None, 9 * S)
     assert not stamp_went_backwards(10 * S, 0)
+
+
+def test_hold_sample_must_be_measured_after_the_request():
+    from gello_ros.freshness import sample_after_request
+    request_ros, request_mono = 10 * S, 5 * S
+    # 要求の後に受信し、stamp も要求以降 → 使える
+    assert sample_after_request(request_ros, request_mono, 5 * S + 1, 10 * S + 1)
+    # 要求の後に受信したが、計測は 80 ms 前（遅れて届いた）→ 使わない
+    assert not sample_after_request(request_ros, request_mono, 5 * S + 1, int(9.92 * S))
+    # stamp がない → いつ計測したか分からないので使わない
+    assert not sample_after_request(request_ros, request_mono, 5 * S + 1, 0)
+    # 要求より前に受信 → 使わない
+    assert not sample_after_request(request_ros, request_mono, 5 * S, 10 * S + 1)

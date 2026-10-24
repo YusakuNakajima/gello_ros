@@ -5,7 +5,7 @@ from scipy.spatial.transform import Rotation as R
 
 from gello_ros.robots.robot import Robot
 from gello_ros.robots.pose_command_guard import PoseCommandLimits, limit_pose_command, normalized_pose
-from gello_ros.freshness import input_age_s, monotonic_ns, stamp_to_ns, stamp_went_backwards
+from gello_ros.freshness import input_age_s, monotonic_ns, sample_after_request, stamp_to_ns, stamp_went_backwards
 
 import rclpy
 from rclpy.node import Node
@@ -373,14 +373,16 @@ class CartesianImpedanceControlRobot(Robot, Node):
         # その後ロボットが動いていると、速度の上限なしで後ろへ引き戻す目標になる。
         # 待つのは最大 2 × joint_state_timeout_ms。期限は壁時計（monotonic）で決める
         #（ROS 時刻は use_sim_time で /clock が止まると進まない）
-        requested_ns = monotonic_ns()
+        # 受信が要求より後でも、遅れて届いた古いサンプル（stamp が要求より前）や stamp のないサンプルは使わない
+        request_monotonic_ns = monotonic_ns()
+        request_ros_ns = self.get_clock().now().nanoseconds
         deadline_s = time.monotonic() + 2 * self.joint_state_timeout_ns * 1e-9
         measured = None
         while rclpy.ok() and time.monotonic() <= deadline_s:
             rclpy.spin_once(self, timeout_sec=0.005)
-            if self._joint_state_received_ns is not None and self._joint_state_received_ns > requested_ns:
-                now_ns = self.get_clock().now().nanoseconds
-                measured = self._measured_pose(now_ns)
+            if sample_after_request(request_ros_ns, request_monotonic_ns,
+                                    self._joint_state_received_ns, self._joint_state_stamp_ns):
+                measured = self._measured_pose(self.get_clock().now().nanoseconds)
                 break
         measured = normalized_pose(measured) if measured is not None else None
         if measured is None:
@@ -392,7 +394,7 @@ class CartesianImpedanceControlRobot(Robot, Node):
             return False
         self._publish_pose(measured)
         self._last_command_pose = measured
-        self._last_command_ns = now_ns
+        self._last_command_ns = self.get_clock().now().nanoseconds
         return True
 
     def command_pose(self, pose: np.ndarray) -> None:

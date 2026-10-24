@@ -153,7 +153,13 @@ class RobotEnv(Node):
         return 0
 
     def step(self, action: Dict[str, np.ndarray]) -> Dict[str, Any]:
-        if action.get("hold_measured", False) and hasattr(self._robot, "hold_measured_pose"):
+        if hasattr(self._robot, "last_sent_pose"):
+            # この周期に送った姿勢だけが残るよう、毎周期消す（送らなければ記録は NaN になる）
+            self._robot.last_sent_pose = None
+        if not action.get("send_command", True):
+            # 送らない（テレオペ停止中など）。controller は最後に送った目標（止めたときの計測姿勢）を保つ
+            pass
+        elif action.get("hold_measured", False) and hasattr(self._robot, "hold_measured_pose"):
             # 止めるとき: 速度の上限を掛けずに、いまの計測姿勢を目標にする
             self._robot.hold_measured_pose()
         elif self._control_mode == "cartesian":

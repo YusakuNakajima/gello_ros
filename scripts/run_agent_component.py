@@ -430,7 +430,10 @@ class AgentNode(Node):
         if not self.move_home_before_run:
             self.get_logger().warn("move_home_before_run is false; starting from the current pose.")
             self.obs = self.env.wait_for_fresh_inputs()
-            return not self.obs["stale_sensors"]
+            if self.obs["stale_sensors"]:
+                self.get_logger().error(f"Stale inputs {self.obs['stale_sensors']}; not starting.")
+                return False
+            return True
         self.get_logger().info("Moving to the home pose...")
         action = {'ee_pos': self.robot_home_pose_with_touch[:3], 'ee_quat': self.robot_home_pose_with_touch[3:]}
         self.obs = self.env.wait_for_fresh_inputs()

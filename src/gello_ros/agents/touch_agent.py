@@ -533,12 +533,8 @@ class TouchAgent(Agent, Node):
             self.get_logger().debug(f"  - published force feedback: [{wrench_feedback.force.x:.3f}, {wrench_feedback.force.y:.3f}, {wrench_feedback.force.z:.3f}]")
 
         if self._is_teleop_active and not self._was_teleop_active:
-            # ボタンを押した時の開始姿勢は、保持されている目標姿勢（なければ現在の実際の姿勢）
-            if self._robot_current_pose is not None:
-                self._robot_start_pose = self._robot_current_pose.copy()
-            else:
-                self._robot_start_pose = current_ee_pose
-            
+            # ボタンを押した時の開始姿勢は、その時点の計測姿勢（停止中に覚えていた姿勢は古いことがある）
+            self._robot_start_pose = current_ee_pose.copy()
             self._robot_start_pose_with_touch = self._touch_current_pose
             # self.get_logger().info("テレオペレーション開始")
         elif not self._is_teleop_active and self._was_teleop_active:
@@ -594,6 +590,10 @@ class TouchAgent(Agent, Node):
             "ee_euler": R.from_quat(target_quat).as_euler('xyz'),
             # 離した周期だけ、速度の上限を掛けずに計測姿勢で止める（RobotEnv.step が見る）
             "hold_measured": released,
+            # テレオペ停止中は何も送らない。止めたときに送った目標を controller が保つ。
+            # 停止中に覚えている姿勢（止めたときの観測、joint state が途切れていれば古い値）を送り続けると、
+            # 止めたあとや通信の復帰後に、その姿勢へ戻る動きになる
+            "send_command": self._is_teleop_active or released,
         }
         
         # デバッグ: 最終アクション結果を表示

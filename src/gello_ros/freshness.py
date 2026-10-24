@@ -42,3 +42,15 @@ def input_age_s(now_ros_ns: int, received_monotonic_ns: Optional[int], stamp_ns:
 def stamp_went_backwards(previous_stamp_ns: Optional[int], stamp_ns: int) -> bool:
     """header.stamp が前の値より戻ったか（0 は時刻なしとして比較しない）。"""
     return bool(stamp_ns) and bool(previous_stamp_ns) and stamp_ns < previous_stamp_ns
+
+
+def sample_after_request(request_ros_ns: int, request_monotonic_ns: int,
+                         received_monotonic_ns: Optional[int], stamp_ns: Optional[int]) -> bool:
+    """止めると決めた後に計測されたサンプルか。
+
+    受信が要求より後で、かつ header.stamp が要求時刻以降のものだけを認める。遅れて届いた古いサンプル
+    （受信は後でも stamp が前）や、stamp のないサンプル（いつ計測したか分からない）は認めない。
+    """
+    if received_monotonic_ns is None or received_monotonic_ns <= request_monotonic_ns:
+        return False
+    return bool(stamp_ns) and stamp_ns >= request_ros_ns
