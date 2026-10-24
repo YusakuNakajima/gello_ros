@@ -5,10 +5,11 @@ from functools import partial
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 
 from gello_ros.robots.robot import Robot
+from gello_ros.freshness import input_age_s, monotonic_ns, stamp_to_ns, stamp_went_backwards
 
 
 def image_msg_to_numpy(msg: Image) -> np.ndarray:
@@ -87,6 +88,14 @@ class RobotEnv(Node):
         # Camera handling - Zero-copy mode
         self.camera_names = camera_names
         self.camera_images = {}  # Store Image messages directly for zero-copy
+        # カメラごとに最後に画像を受信した時刻（monotonic、ns）と、その header.stamp（ROS 時刻、ns）
+        self.camera_received_ns = {}
+        self.camera_stamp_ns = {}
+        # 画像・力センサの値がこれより古ければ、観測の stale_sensors に名前を入れる（ms）
+        self.declare_parameter("sensor_timeout_ms", 200.0)
+        self.sensor_timeout_s = self.get_parameter("sensor_timeout_ms").get_parameter_value().double_value * 1e-3
+        if not self.sensor_timeout_s > 0.0:
+            raise ValueError("sensor_timeout_ms must be > 0")
         self.latest_valid_images = {}  # Store latest valid numpy arrays as fallback
         if self.camera_names:
             self.start_camera_subscribers()
@@ -100,7 +109,9 @@ class RobotEnv(Node):
                 Image,
                 topic_name,
                 partial(self._camera_color_callback, camera_name),
-                qos_profile_sensor_data,
+                # 最新の 1 枚だけを持つ。sensor_data の depth 5 だと、spin しない時間（推論など）のあと
+                # 溜まっていた古い画像から順に処理され、観測が期限ぎりぎりの画像になる
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST),
             )
             self.get_logger().info(f"Subscribed to {topic_name} in RobotEnv")
         
@@ -122,7 +133,13 @@ class RobotEnv(Node):
         """Callback for the color image - Zero-copy mode: store Image message directly."""
         # Store the Image message directly for zero-copy access
         # Image-to-numpy conversion will be done on-demand in get_obs()
+        stamp_ns = stamp_to_ns(msg.header.stamp)
+        if stamp_went_backwards(self.camera_stamp_ns.get(camera_name), stamp_ns):
+            self.get_logger().warn(f"{camera_name}: image stamp went backwards; ignoring it.", throttle_duration_sec=5)
+            return
         self.camera_images[camera_name] = msg
+        self.camera_received_ns[camera_name] = monotonic_ns()
+        self.camera_stamp_ns[camera_name] = stamp_ns
 
     def robot(self) -> Robot:
         """Get the robot object.
@@ -136,8 +153,19 @@ class RobotEnv(Node):
         return 0
 
     def step(self, action: Dict[str, np.ndarray]) -> Dict[str, Any]:
-        
-        if self._control_mode == "cartesian":
+        if hasattr(self._robot, "last_sent_pose"):
+            # この周期に送った姿勢だけが残るよう、毎周期消す（送らなければ記録は NaN になる）
+            self._robot.last_sent_pose = None
+        if not action.get("send_command", True):
+            # 送らない（テレオペ停止中など）。controller は最後に送った目標（止めたときの計測姿勢）を保つ。
+            # ただし止めるのに失敗していたら（joint state が途切れていた）、計測が戻ったところで止め直す
+            if getattr(self._robot, "hold_pending", False):
+                self._robot.hold_measured_pose()
+        elif action.get("hold_measured", False) and hasattr(self._robot, "hold_measured_pose"):
+            # 止めるとき: 速度の上限を掛けずに、いまの計測姿勢を目標にする
+            self._robot.hold_measured_pose()
+        elif self._control_mode == "cartesian":
+            # hold_measured_pose のないロボット（指令ガードなしの他のcontroller）は、従来どおり action の姿勢を送る
             # Ensure keys exist before accessing
             if "ee_pos" in action and "ee_quat" in action:
                 pos_quat = np.concatenate([action["ee_pos"], action["ee_quat"]])
@@ -151,11 +179,33 @@ class RobotEnv(Node):
         self._rate.sleep()
         return self.get_obs()
     
+    def stale_now(self, obs: Dict[str, Any]) -> List[str]:
+        """obs の入力のうち、今の時点で sensor_timeout_ms を超えたものの名前（観測を作ってからの経過時間を足す）。"""
+        elapsed_s = (monotonic_ns() - obs["obs_monotonic_ns"]) * 1e-9
+        stale = [name for name, age_s in obs["sensor_ages_s"].items() if age_s + elapsed_s > self.sensor_timeout_s]
+        return stale + [name for name in obs["stale_sensors"] if name not in stale]
+
+    def wait_for_fresh_inputs(self, timeout_s: float = 2.0) -> Dict[str, Any]:
+        """溜まっていたコールバックを処理し、入力が新しくなるまで最大 timeout_s 待って観測を返す。
+
+        方策の読み込みなどで spin しない時間があると、最初に処理する画像は溜まっていた古いものになる。
+        """
+        deadline = time.monotonic() + timeout_s
+        obs = self.get_obs()
+        while obs["stale_sensors"] and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.01)
+            obs = self.get_obs()
+        return obs
+
     def get_obs(self) -> Dict[str, Any]:
         """Get observation from the environment."""
         # Only spin robot node to update robot states
         # Camera updates are handled by the main spin loop in component mode
+        # spin_once は 1 回に 1 つのコールバックしか処理しない。高い周期の力センサ（~1 kHz）の間に
+        # joint state（30 Hz など）が処理されないまま古くなるので、待っているもの（各 depth 1）を何回か処理する
         rclpy.spin_once(self._robot, timeout_sec=0.001)
+        for _ in range(3):
+            rclpy.spin_once(self._robot, timeout_sec=0.0)
         rclpy.spin_once(self, timeout_sec=0.0001) # Process camera callbacks
 
         observations = {}
@@ -181,6 +231,24 @@ class RobotEnv(Node):
         robot_obs = self._robot.get_observations()
         # It's safer to merge dictionaries
         observations.update(robot_obs)
+
+        # 途切れた・遅れて届く入力（古い画像・力・joint state）を、ほかの入力と組み合わせて使わないよう、
+        # 古い入力の名前を載せる（受信時刻と header.stamp の両方で判定）
+        now_ns = self.get_clock().now().nanoseconds
+        ages_s = {
+            name: input_age_s(now_ns, self.camera_received_ns.get(name), self.camera_stamp_ns.get(name))
+            for name in self.camera_names
+        }
+        if "wrench_age_s" in observations:
+            ages_s["wrench"] = observations["wrench_age_s"]
+        stale = [name for name, age_s in ages_s.items() if age_s > self.sensor_timeout_s]
+        if not observations.get("joint_state_fresh", True):
+            stale.append("joint_states")
+        observations["stale_sensors"] = stale
+        # 観測を作った時刻と各入力の古さ。方策の計算中に期限が切れていないかを、送る直前に stale_now() で確かめる
+        # 経過時間は壁時計で測る（ROS 時刻は止まったり戻ったりする）
+        observations["obs_monotonic_ns"] = monotonic_ns()
+        observations["sensor_ages_s"] = ages_s
         
         # Ensure essential keys are present
         assert "joint_positions" in observations

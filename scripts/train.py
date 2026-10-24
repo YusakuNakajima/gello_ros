@@ -149,7 +149,7 @@ if __name__ == "__main__":
     os.makedirs(checkpoint_dir, exist_ok=True)
     # number of training episodes
     data_dir = task_cfg["dataset_dir"]
-    num_episodes = len(os.listdir(data_dir))
+    num_episodes = len(episode_ids(data_dir))  # episode_<n>.hdf5 だけを数える
 
     # load data
     train_dataloader, val_dataloader, stats, _ = load_data(

@@ -50,13 +50,24 @@
     joint_trajectory_controller_command_topic: "/fr3_arm_controller/joint_trajectory"
     cartesian_motion_controller_command_topic: "/cartesian_motion_controller/target_frame"
     cartesian_compliance_controller_command_topic: "/cartesian_compliance_controller/target_frame"
-    cartesian_impedance_controller_command_topic: "/reference_pose"
+    # onolab_ros2 の cartesian_impedance_controller は「<controller名>/reference_pose」を読む
+    cartesian_impedance_controller_command_topic: "/cartesian_impedance_controller/reference_pose"
     # sensor topic  
     feedback_wrench_topic: "/leptrino/wrench/filtered"
     feedback_wrench_zero_service: "/leptrino/wrench/filtered/zero_ftsensor"
     # robot description
     joint_states_topic: "/joint_states"
     robot_description_name: "/robot_description"
+
+    # 指令ガード（robots/pose_command_guard.py）。すべての指令は controller に送る前にこの上限で制限する。
+    # 値の出どころ: 暫定の推測値（2026-10-24、模擬HWでのみ確認。実機では未確認）。
+    # 追従誤差の上限は onolab_ros2 の joy_cartesian_teleop（FR3）と同じ 20 mm / 0.1 rad にした
+    max_linear_speed_m_per_s: 0.1
+    max_angular_speed_rad_per_s: 0.5
+    max_tracking_error_m: 0.02
+    max_tracking_error_rad: 0.1
+    joint_state_timeout_ms: 100.0
+    max_command_interval_s: 0.02
 
 
     robot_home_pose_with_touch:

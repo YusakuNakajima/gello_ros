@@ -23,17 +23,14 @@ def launch_setup(context, *args, **kwargs):
     controller_type = LaunchConfiguration('controller_type').perform(context)
     
     # Robot description generation for Franka FR3
+    # KDL で FK を計算するためのモデル。config/franka_fr3.yaml の ee_link（pestle_tip）と
+    # feedback_wrench_sensor_frame（leptrino_frame）を含む、onolab_ros2 のペストル + Leptrino 構成を使う。
+    # ロボット側は onolab_robot_bringup の franka_fr3_bringup_with_pestle.launch.py で起動すること
     robot_description_content = Command(
         [
             PathJoinSubstitution([FindExecutable(name="xacro")]),
             " ",
-            PathJoinSubstitution([FindPackageShare("franka_description"), "robots", "fr3", "fr3.urdf.xacro"]),
-            " ",
-            "hand:=true",
-            " ",
-            "ee_id:=franka_hand",
-            " ",
-            "robot_ip:=192.168.1.1",
+            PathJoinSubstitution([FindPackageShare("onolab_robot_description"), "robots", "fr3", "fr3_with_pestle_and_leptrino.urdf.xacro"]),
         ]
     )
     

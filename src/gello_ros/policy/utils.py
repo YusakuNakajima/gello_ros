@@ -1,4 +1,5 @@
 import os
+import re
 import h5py
 import torch
 import numpy as np
@@ -12,8 +13,11 @@ e = IPython.embed
 
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, include_ft):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, include_ft, max_episode_len=None):
         super(EpisodicDataset, self).__init__()
+        # action と padding mask をこの長さに揃える（quit で途中保存したエピソードと混ぜても batch にできるよう、
+        # データセット中で最も長いエピソードの長さ）。None なら各エピソード自身の長さ（以前の動作）
+        self.max_episode_len = max_episode_len
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
@@ -31,6 +35,8 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
         with h5py.File(dataset_path, "r") as root:
             is_sim = root.attrs["sim"]
+            # action と観測の index の対応。新しいファイルは action_alignment、古いファイルは sim で判定する
+            same_step = (root.attrs["action_alignment"] == "same_step") if "action_alignment" in root.attrs else bool(is_sim)
             episode_len = root["/action/ee_pos"].shape[0]
 
             if sample_full_episode:
@@ -53,7 +59,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 ft = root["/observations/wrench"][start_ts]
                 
             # Build action by concatenating /action/ee_pos and flattened /observations/ee_rot_matrix over timesteps
-            if is_sim:
+            if same_step:
                 act_ee_pos = root["/action/ee_pos"][start_ts:]
                 act_rot = root["/action/ee_rot_matrix"][start_ts:]
                 action_len = episode_len - start_ts
@@ -67,12 +73,12 @@ class EpisodicDataset(torch.utils.data.Dataset):
         # Concatenate along the second axis (flatten rot matrix for each timestep)
         action = np.concatenate((act_ee_pos, act_rot.reshape(act_rot.shape[0], -1)), axis=1)
 
-        # Pad action to the original shape if needed
-        original_action_shape = (episode_len, action.shape[1])
-        padded_action = np.zeros(original_action_shape, dtype=np.float32)
+        # Pad action to a common length so episodes of different lengths can be batched
+        padded_len = self.max_episode_len if self.max_episode_len is not None else episode_len
+        padded_action = np.zeros((padded_len, action.shape[1]), dtype=np.float32)
         padded_action[:action_len] = action
 
-        is_pad = np.zeros(episode_len)
+        is_pad = np.zeros(padded_len)
         is_pad[action_len:] = 1
 
         # Stack images from different cameras
@@ -88,17 +94,17 @@ class EpisodicDataset(torch.utils.data.Dataset):
         is_pad = torch.from_numpy(is_pad).bool()
         
         if self.include_ft:
-            ft_data = torch.from_numpy(ft).float()
-            ft_data = (ft_data - self.norm_stats["ft_mean"]) / self.norm_stats["ft_std"]
+            ft_data = torch.from_numpy(normalize_ft(self.norm_stats, ft)).float()
         else:
             ft_data = []
 
 
         # Return tuple: image data, observation, action, and padding mask
+        observation = normalize_observation(self.norm_stats, observation)
         return image_data, torch.from_numpy(observation).float(), ft_data, action_data, is_pad
 
 
-def get_norm_stats(dataset_dir, num_episodes, include_ft):
+def get_norm_stats(dataset_dir, ids, include_ft):
     """
     各エピソードのHDF5ファイルから、観測とアクションのデータを読み込み、
     各々の平均と標準偏差を計算する。
@@ -109,7 +115,7 @@ def get_norm_stats(dataset_dir, num_episodes, include_ft):
     all_ft_data = []
     all_action_data = []
     
-    for episode_idx in range(num_episodes):
+    for episode_idx in ids:
         dataset_path = os.path.join(dataset_dir, f"episode_{episode_idx}.hdf5")
         with h5py.File(dataset_path, "r") as root:
             # 読み込み: 観測側
@@ -166,24 +172,57 @@ def get_norm_stats(dataset_dir, num_episodes, include_ft):
     return stats
 
 
+EPISODE_FILE = re.compile(r"^episode_(\d+)\.hdf5$")
+
+
+def episode_ids(dataset_dir):
+    """dataset_dir にある episode_<n>.hdf5 の番号（昇順）。保存途中の一時ファイルなどは数えない。"""
+    return sorted(int(m.group(1)) for m in map(EPISODE_FILE.match, os.listdir(dataset_dir)) if m)
+
+
+def normalize_observation(stats, observation):
+    """方策に渡す手先姿勢（位置 + 回転行列）の正規化。学習と推論で同じものを使う。"""
+    return (np.asarray(observation) - stats["obs_mean"]) / stats["obs_std"]
+
+
+def normalize_ft(stats, ft):
+    """方策に渡す力・トルクの正規化。学習と推論で同じものを使う。"""
+    return (np.asarray(ft) - stats["ft_mean"]) / stats["ft_std"]
+
+
+def max_episode_length(dataset_dir, ids):
+    """ids のエピソードのうち、最も長いもののステップ数。"""
+    lengths = []
+    for episode_idx in ids:
+        with h5py.File(os.path.join(dataset_dir, f"episode_{episode_idx}.hdf5"), "r") as root:
+            lengths.append(root["/action/ee_pos"].shape[0])
+    return max(lengths)
+
+
 def load_data(
     dataset_dir, num_episodes, camera_names, include_ft, batch_size_train, batch_size_val
 ):
     print(f"\nData from: {dataset_dir}\n")
     # obtain train test split
     train_ratio = 0.8
-    shuffled_indices = np.random.permutation(num_episodes)
+    # 実際にある episode_<n>.hdf5 の番号を使う（保存に失敗した番号は欠ける。num_episodes は互換のためだけ）
+    ids = episode_ids(dataset_dir)
+    num_episodes = len(ids)
+    shuffled_indices = np.random.permutation(ids)
     train_indices = shuffled_indices[: int(train_ratio * num_episodes)]
     val_indices = shuffled_indices[int(train_ratio * num_episodes) :]
 
     # obtain normalization stats for qpos and action
-    norm_stats = get_norm_stats(dataset_dir, num_episodes, include_ft)
+    norm_stats = get_norm_stats(dataset_dir, ids, include_ft)
+    max_episode_len = max_episode_length(dataset_dir, ids)
 
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(
-        train_indices, dataset_dir, camera_names, norm_stats, include_ft
+        train_indices, dataset_dir, camera_names, norm_stats, include_ft, max_episode_len
     )
-    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, include_ft)
+    val_dataset = EpisodicDataset(
+        val_indices, dataset_dir, camera_names, norm_stats, include_ft, max_episode_len
+    )
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,

@@ -29,6 +29,7 @@ install(PROGRAMS
   scripts/run_gello.py
   scripts/run_GUI_component.py
   scripts/train.py
+  scripts/policy_config.py
   scripts/gello_get_offset.py
   DESTINATION lib/${PROJECT_NAME}
 )
@@ -51,15 +52,26 @@ install(DIRECTORY config/
 # The component discovery is done through Python entry points
 
 if(BUILD_TESTING)
-  find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
-  set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
-  set(ament_cmake_cpplint_FOUND TRUE)
-  ament_lint_auto_find_test_dependencies()
+  # 既存コードは ament_lint に合わせていないので、lint は使わず pytest だけ実行する
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_pose_command_guard test/test_pose_command_guard.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  ament_add_pytest_test(test_touch_force_frame test/test_touch_force_frame.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  ament_add_pytest_test(test_freshness test/test_freshness.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  ament_add_pytest_test(test_mixed_length_episodes test/test_mixed_length_episodes.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  ament_add_pytest_test(test_stop_transitions test/test_stop_transitions.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  ament_add_pytest_test(test_save_episode test/test_save_episode.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
 endif()
 
 ament_package()

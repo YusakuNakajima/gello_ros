@@ -6,7 +6,11 @@
     touch_force_feedback_topic: "/touch/force_feedback"
     touch_base_frame: "touch_base"
     touch_force_frame: "touch_force"  
-    teleoperation_mode: "bilateral" # "unilateral" or "bilateral"
+    # "unilateral"（力覚なし）か "bilateral"（力覚あり）。既定は unilateral。
+    # Touch ドライバ（touch_state）は最後に受け取った力を出し続け、受信が途切れても 0 にしない。
+    # このエージェントが異常終了・通信断すると力が残るので、ドライバ側で受信の期限切れを見るまでは、
+    # bilateral は人が Touch を持っている状態で明示的に選ぶ
+    teleoperation_mode: "unilateral"
     use_gripper: False
     use_FT_sensor: True
     touch_max_force: 3.3
@@ -18,11 +22,16 @@
     camera_width: 640
     camera_height: 480
     camera_fps: 30
+    # 画像・力センサの値がこれより古ければ、記録中のエピソードは捨て、方策の実行は止める（ms）。
+    # 暫定の推測値（2026-10-24、模擬HWのみ）。30 fps のカメラなら 6 フレーム分
+    sensor_timeout_ms: 200.0
 
     # imitation learning config
     task_name: "grinding_test"
-    save_episode_dir: "/home/ros/onolab_ros2/ros2_ws/src/gello_ros/scripts/episode_data"
-    eval_ckpt_dir: "/home/ros/onolab_ros2/ros2_ws/src/gello_ros/scripts/checkpoints/20250901_172954_grinding_test"
+    # 記録したハードウェア（hdf5 の attrs["hardware"] に残す）。実機で記録するときは "real"、模擬HWなら "fake"
+    hardware_label: "unspecified"
+    save_episode_dir: "/home/ros/onolab_ros2/gello_data/episode_data"
+    eval_ckpt_dir: "/home/ros/onolab_ros2/gello_data/checkpoints/20250901_172954_grinding_test"
     number_of_episodes: 10 # trials
     number_of_steps: 10000 # steps for each episode
     control_mode: "cartesian" # "joint" or "cartesian"

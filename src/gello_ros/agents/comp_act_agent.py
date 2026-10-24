@@ -6,6 +6,7 @@ import rclpy
 from rclpy.node import Node
 import torch
 from gello_ros.agents.agent import Agent
+from gello_ros.policy.utils import normalize_ft, normalize_observation
 from scipy.spatial.transform import Rotation as R
 
 class CompACTAgent(Agent, Node):
@@ -57,7 +58,8 @@ class CompACTAgent(Agent, Node):
 
         # Preprocess and postprocess lambdas
         self.pre_process = (
-            lambda s_qpos: (s_qpos - self.stats["obs_mean"]) / self.stats["obs_std"]
+            # 学習（EpisodicDataset）と同じ正規化
+            lambda s_qpos: normalize_observation(self.stats, s_qpos)
         )
         self.post_process = (
             lambda a: a * self.stats["action_std"] + self.stats["action_mean"]
@@ -137,7 +139,8 @@ class CompACTAgent(Agent, Node):
             )
             
             # process force-torque readings if used
-            force_torque = torch.from_numpy(obs["ee_wrench"]).float().to(self.device).unsqueeze(0)
+            # 学習と同じく正規化する（以前は生の値を渡しており、学習時の入力と食い違っていた）
+            force_torque = torch.from_numpy(normalize_ft(self.stats, obs["ee_wrench"])).float().to(self.device).unsqueeze(0)
 
             # Call the policy to get actions at specific time steps
             if t % self.query_frequency == 0:

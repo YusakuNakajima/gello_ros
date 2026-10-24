@@ -28,16 +28,28 @@ from gello_ros.policy.utils import *
 
 import rclpy
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
+from scipy.spatial.transform import Rotation as R
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.parameter import Parameter, ParameterType
 from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Wrench, PoseStamped
 from sensor_msgs.msg import Image
 from std_msgs.msg import String, Header
-from cv_bridge import CvBridge
 import threading
 import traceback
 
+
+
+# SIGINT / SIGTERM を受けたら立てる（main の signal_handler）
+SHUTDOWN_SIGNALLED = threading.Event()
+
+
+def abort_if_shutdown_signalled():
+    """起動中の移動（GELLO の初期移動など）で、指令を送る前に終了要求を確かめる。受けていれば初期化を中止する
+    （initialize_agent の except から cleanup して終了する）。"""
+    if SHUTDOWN_SIGNALLED.is_set():
+        raise RuntimeError("Shutdown requested during startup")
 
 
 class AgentNode(Node):
@@ -48,7 +60,6 @@ class AgentNode(Node):
         self.agent = None
         self.camera_images = {}
         self.button_state = "pass"
-        self.bridge = CvBridge()
         self.shutdown_requested = False
         self.component_mode = kwargs.get('component_mode', False)
         
@@ -98,6 +109,14 @@ class AgentNode(Node):
         self.declare_parameter("save_episode_dir", "./episode_data")
         self.declare_parameter("task_name", "default")
         self.declare_parameter("robot_description", "")
+        # 方策の実行・エピソードの記録の前にホーム姿勢（robot_home_pose_with_touch）へ動かすか
+        # エピソードの hdf5 に残す、記録したハードウェア（"real" / "fake" など）。後から実機と模擬を区別するため
+        self.declare_parameter("hardware_label", "unspecified")
+        self.declare_parameter("move_home_before_run", True)
+        # ホーム姿勢への移動の制限時間（s）と、到達とみなす差（m、rad）。暫定の推測値（模擬HWでのみ確認）
+        self.declare_parameter("home_move_timeout_s", 15.0)
+        self.declare_parameter("home_position_tolerance_m", 0.005)
+        self.declare_parameter("home_orientation_tolerance_rad", 0.05)
 
     def get_parameters(self):
         """Get all parameters from ROS2 parameter server"""
@@ -120,6 +139,10 @@ class AgentNode(Node):
         self.number_of_steps = self.get_parameter("number_of_steps").get_parameter_value().integer_value
         self.eval_ckpt_dir = self.get_parameter("eval_ckpt_dir").get_parameter_value().string_value
         self.robot_description = self.get_parameter("robot_description").get_parameter_value().string_value
+        self.move_home_before_run = self.get_parameter("move_home_before_run").get_parameter_value().bool_value
+        self.home_move_timeout_s = self.get_parameter("home_move_timeout_s").get_parameter_value().double_value
+        self.home_position_tolerance_m = self.get_parameter("home_position_tolerance_m").get_parameter_value().double_value
+        self.home_orientation_tolerance_rad = self.get_parameter("home_orientation_tolerance_rad").get_parameter_value().double_value
         
         # Mock is hardcoded to False for now
         self.mock = False
@@ -186,6 +209,7 @@ class AgentNode(Node):
                     )
         except Exception as e:
             self.get_logger().fatal(f"Failed to initialize robot, shutting down. Error: {e}")
+            self.cleanup()
             sys.exit(1)
 
     def initialize_agent(self):
@@ -227,6 +251,7 @@ class AgentNode(Node):
                     max_delta = (np.abs(gello_curr_joints - gello_reset_joints)).max()
                     steps = min(int(max_delta / 0.01), 100)
                     for jnt in np.linspace(gello_curr_joints, gello_reset_joints, steps):
+                        abort_if_shutdown_signalled()
                         self.env.step({'joint_positions': jnt})
                         time.sleep(0.001)
 
@@ -270,6 +295,7 @@ class AgentNode(Node):
                     max_joint_delta = np.abs(delta).max()
                     if max_joint_delta > max_delta:
                         delta = delta / max_joint_delta * max_delta
+                    abort_if_shutdown_signalled()
                     self.obs = self.env.step({'joint_positions': current_joints + delta})
 
                 # check if the joints are close
@@ -346,6 +372,9 @@ class AgentNode(Node):
                 raise ValueError("Invalid agent type: %s" % self.agent_type)
         except Exception as e:
             self.get_logger().fatal(f"Failed to initialize agent, shutting down. Error: {e}")
+            # 初期化の途中（ホーム姿勢への移動など）で失敗しても、姿勢の保持と Touch の力 0 を済ませてから終わる。
+            # コンストラクタが終わらないので、main の cleanup は呼ばれない
+            self.cleanup()
             sys.exit(1)
     
     # Images are now handled by RobotEnv with zero-copy - no need for separate _add_images_to_obs
@@ -367,36 +396,116 @@ class AgentNode(Node):
 
         # Move the robot to the configured home pose if not skipping
         if not self.skip_initial_move:
-            self.get_logger().info("Moving to the home pose...")
-            action = {'ee_pos': self.robot_home_pose_with_touch[:3], 'ee_quat': self.robot_home_pose_with_touch[3:]}
-            for _ in range(self.hz * 5):  # Move for 5 seconds
-                self.obs=self.env.step(action)
-                self.agent.act(self.obs,force_pose_update=True)
-                
+            if not self._move_home(update_agent=True):
+                raise RuntimeError("The initial move to the home pose stopped (timeout, stale inputs or stop request)")
+
+        # skip_initial_move のときも、ループの最初の act() に観測を渡せるようにする
+        if self.obs is None:
+            self.obs = self.env.get_obs()
+
+    def _stop_and_hold(self) -> bool:
+        """速度の上限を掛けずに、いまの計測姿勢を目標にして止める。止められなければ False（エラーを出す）。"""
+        # 止めたあとは、白ボタンを離して押し直すまでテレオペを再開しない（入力が戻っても勝手に動き出さない）
+        if getattr(self, 'agent', None) is not None and hasattr(self.agent, 'zero_force'):
+            # Touch の力を先に 0 にする（このあとの保持・保存待ちの間も、最後の力が出続けないように）
+            self.agent.zero_force()
+        if getattr(self, 'agent', None) is not None and hasattr(self.agent, 'require_rearm'):
+            self.agent.require_rearm()
+        if not hasattr(self.robot, 'hold_measured_pose'):
+            return False
+        held = self.robot.hold_measured_pose()
+        if not held:
+            self.get_logger().error(
+                "Could not hold the measured pose (no fresh joint state). The controller keeps its last target; "
+                "use the emergency stop if the robot keeps moving.")
+        return held
+
+    def _stop_requested(self) -> bool:
+        """SIGINT/SIGTERM、または /GUI_button の quit を受けたか（AgentNode のコールバックを処理してから判定）。"""
+        rclpy.spin_once(self, timeout_sec=0.0)
+        return self.shutdown_requested or SHUTDOWN_SIGNALLED.is_set() or self.button_state == "quit"
+
+    def _home_reached(self) -> bool:
+        home_pos = np.asarray(self.robot_home_pose_with_touch[:3])
+        home_rot = R.from_quat(self.robot_home_pose_with_touch[3:])
+        position_error = np.linalg.norm(np.asarray(self.obs["ee_pos"]) - home_pos)
+        angle_error = np.linalg.norm((R.from_quat(self.obs["ee_quat"]) * home_rot.inv()).as_rotvec())
+        return (position_error <= self.home_position_tolerance_m
+                and angle_error <= self.home_orientation_tolerance_rad)
+
+    def _move_home(self, update_agent: bool = False) -> bool:
+        """ホーム姿勢へ指令を送り（指令ガードで速さを制限）、計測姿勢が到達したら True を返す。
+
+        home_move_timeout_s 以内に届かない、入力（画像・力・joint state）が途切れた、終了要求を受けた場合は、
+        その場で止めて False を返す（方策の実行・記録を始めない）。move_home_before_run が false なら動かさない。
+        """
+        if not self.move_home_before_run:
+            self.get_logger().warn("move_home_before_run is false; starting from the current pose.")
+            self.obs = self.env.wait_for_fresh_inputs()
+            if self.obs["stale_sensors"]:
+                self.get_logger().error(f"Stale inputs {self.obs['stale_sensors']}; not starting.")
+                return False
+            return True
+        self.get_logger().info("Moving to the home pose...")
+        action = {'ee_pos': self.robot_home_pose_with_touch[:3], 'ee_quat': self.robot_home_pose_with_touch[3:]}
+        self.obs = self.env.wait_for_fresh_inputs()
+        deadline = time.monotonic() + self.home_move_timeout_s
+        while not self._home_reached():
+            if self.obs["stale_sensors"]:
+                self.get_logger().error(
+                    f"Stale inputs {self.obs['stale_sensors']}; stopping the move to the home pose.")
+                self._stop_and_hold()
+                return False
+            if self._stop_requested():
+                self.get_logger().info("Stop requested; stopping the move to the home pose.")
+                self._stop_and_hold()
+                return False
+            if time.monotonic() > deadline:
+                self.get_logger().error(
+                    f"Home pose not reached within {self.home_move_timeout_s} s "
+                    f"(now {np.round(self.obs['ee_pos'], 4)}); stopping.")
+                self._stop_and_hold()
+                return False
+            self.obs = self.env.step(action)
+            if update_agent:
+                # Touch の姿勢・ボタンを処理してから act() する（処理しないと Touch が途切れたと判定される）
+                rclpy.spin_once(self.agent, timeout_sec=0.0)
+                self.agent.act(self.obs, force_pose_update=True)
+        return True
 
     def save_episode_thread(self, episode_number, obs_replay, action_replay):
-        """Thread function for saving episodes"""
-        save_episode(self, episode_number, obs_replay, action_replay)
+        """Thread function for saving episodes. 失敗は save_episode がログに残し、最終ファイルは作らない"""
+        try:
+            save_episode(self, episode_number, obs_replay, action_replay)
+        except Exception as e:
+            self.get_logger().error(f"Saving episode {episode_number} failed: {e}")
     
     def cleanup(self):
-        """Clean up resources before shutdown"""
-        self.get_logger().info("Starting cleanup...")
-        try:
-            if hasattr(self, 'robot') and self.robot is not None:
-                self.get_logger().info("Stopping robot...")
-                
-            if hasattr(self, 'agent') and self.agent is not None:
-                self.get_logger().info("Cleaning up agent...")
-                if hasattr(self.agent, 'cleanup'):
-                    self.agent.cleanup()
-            
-            if hasattr(self, 'env') and self.env is not None:
-                self.get_logger().info("Destroying RobotEnv node...")
-                self.env.destroy_node()
+        """Clean up resources before shutdown
 
-            self.get_logger().info("Cleanup completed")
-        except Exception as e:
-            self.get_logger().error(f"Error during cleanup: {e}")
+        Touch の力を 0 にする → ロボットを計測姿勢で保持する → ノードを片付ける、の順に、
+        それぞれ別に例外を受ける（前の段で失敗しても、後の段を飛ばさない）。
+        """
+        self.get_logger().info("Starting cleanup...")
+        agent = getattr(self, 'agent', None)
+        robot = getattr(self, 'robot', None)
+        env = getattr(self, 'env', None)
+        steps = []
+        if agent is not None and hasattr(agent, 'cleanup'):
+            # Touch ドライバは最後の力を出し続けるので、ほかの何よりも先に 0 にする
+            steps.append(("Cleaning up agent (zero Touch force)", agent.cleanup))
+        if robot is not None and hasattr(robot, 'hold_measured_pose'):
+            # 終了後も controller は最後の目標を保つので、計測姿勢に合わせてから終わる
+            steps.append(("Stopping robot", lambda: rclpy.ok() and robot.hold_measured_pose()))
+        if env is not None:
+            steps.append(("Destroying RobotEnv node", env.destroy_node))
+        for label, step in steps:
+            self.get_logger().info(f"{label}...")
+            try:
+                step()
+            except Exception as e:
+                self.get_logger().error(f"Error during cleanup ({label}): {e}")
+        self.get_logger().info("Cleanup completed")
 
         
     def run(self):
@@ -410,7 +519,7 @@ class AgentNode(Node):
         message = ""
         
         try:
-            while rclpy.ok() and not self.shutdown_requested:
+            while rclpy.ok() and not self.shutdown_requested and not SHUTDOWN_SIGNALLED.is_set():
                 # Spin agent if it's a node (e.g., TouchAgent)
                 if self.agent_type in ["touch", "gello"]:
                     rclpy.spin_once(self.agent, timeout_sec=0.001)
@@ -418,14 +527,43 @@ class AgentNode(Node):
                 if self.agent_type in ["act", "comp_act"]:
                     if self.obs is None:
                         self.obs = self.env.get_obs()
-                    self.get_logger().info("Moving to the home pose...")
-                    action = {'ee_pos': self.robot_home_pose_with_touch[:3], 'ee_quat': self.robot_home_pose_with_touch[3:]}
-                    for _ in range(self.hz * 5):  # Move for 5 seconds
-                        self.obs=self.env.step(action)
+                    if not self._move_home():
+                        self.shutdown_requested = True
+                        break
+                    # 1 回目の推論は GPU の初期化で遅く、その間に画像の期限が切れる。結果を捨てる推論を
+                    # 先に 1 回してから、観測を取り直して始める（t=0 でもう一度推論し直すので、結果は使われない）
+                    self.agent.act(self.obs, 0)
+                    self.obs = self.env.wait_for_fresh_inputs()
                     for t in range(self.number_of_steps):
                         time_passed = time.time() - start_time
                         step_st = time.time()
+                        if self._stop_requested():
+                            self.get_logger().info("Stop requested; holding the measured pose.")
+                            self._stop_and_hold()
+                            self.shutdown_requested = True
+                            break
+                        if self.obs["stale_sensors"]:
+                            # 途切れた画像・力で方策を動かし続けないよう、その場で止めて終了する
+                            self.get_logger().error(
+                                f"Stale inputs {self.obs['stale_sensors']}; stopping the policy and holding the measured pose.")
+                            self._stop_and_hold()
+                            self.shutdown_requested = True
+                            break
                         action = self.agent.act(self.obs, t)
+                        if self._stop_requested():
+                            # 推論中に終了要求を受けた。計算した指令は送らない
+                            self.get_logger().info("Stop requested during inference; holding the measured pose.")
+                            self._stop_and_hold()
+                            self.shutdown_requested = True
+                            break
+                        stale_now = self.env.stale_now(self.obs)
+                        if stale_now:
+                            # 方策の計算中に入力の期限が切れた。古い観測から作った指令は送らない
+                            self.get_logger().error(
+                                f"Inputs {stale_now} expired before sending; stopping the policy and holding the measured pose.")
+                            self._stop_and_hold()
+                            self.shutdown_requested = True
+                            break
                         self.obs = self.env.step(action)
                         message = f"Agent {self.agent_type} Steps: {t} Time passed: {round(time_passed, 2)} Step: {t} Time for step: {round((time.time() - step_st)*1000,1)} ms"
                         self.get_logger().info(message)
@@ -444,36 +582,87 @@ class AgentNode(Node):
                             self.get_logger().info("All episodes done")
                             break
                         
-                        self.get_logger().info("Moving to the home pose...")
-                        action = {'ee_pos': self.robot_home_pose_with_touch[:3], 'ee_quat': self.robot_home_pose_with_touch[3:]}
-                        for _ in range(self.hz * 5):  # Move for 5 seconds
-                            self.obs=self.env.step(action)
-                            self.agent.act(self.obs,force_pose_update=True)
+                        if not self._move_home(update_agent=True):
+                            self.get_logger().error(f"Not recording episode {current_episode_number}: the move to the home pose stopped.")
+                            if self.button_state != "quit":  # quit なら次の周回で終了する
+                                self.button_state = "pass"
+                            continue
                             
                         st_episode = time.time()
+                        episode_aborted = False
                         for i in range(self.number_of_steps):
                             rclpy.spin_once(self.agent, timeout_sec=0.001)
 
                             # Check if user wants to quit mid-episode
+                            rclpy.spin_once(self, timeout_sec=0.0)  # /GUI_button を処理する
+                            if SHUTDOWN_SIGNALLED.is_set():
+                                self.get_logger().info("Shutdown requested during episode; discarding it.")
+                                self._stop_and_hold()
+                                episode_aborted = True
+                                break
                             if self.button_state == "quit":
-                                self.get_logger().info("Quit command received during episode, stopping.")
+                                # ここまでを保存して終了する（テレオペには戻らない）
+                                self.get_logger().info("Quit command received during episode; saving it and exiting.")
+                                self._stop_and_hold()
                                 break
                             
                             step_st = time.time()
+                            if self.obs["stale_sensors"]:
+                                # 古い画像・力を新しい姿勢と組み合わせたエピソードを残さない
+                                self.get_logger().error(
+                                    f"Stale inputs {self.obs['stale_sensors']}; discarding episode {current_episode_number}.")
+                                self._stop_and_hold()
+                                episode_aborted = True
+                                break
                             action = self.agent.act(self.obs)
+                            rclpy.spin_once(self, timeout_sec=0.0)  # act() 中に届いた /GUI_button を処理する
+                            if SHUTDOWN_SIGNALLED.is_set() or self.button_state == "quit":
+                                # 計算した指令は送らずに止める。quit ならここまでを保存して終了、シグナルなら捨てる
+                                self.get_logger().info("Stop requested during act(); holding the measured pose.")
+                                self._stop_and_hold()
+                                episode_aborted = SHUTDOWN_SIGNALLED.is_set()
+                                break
+                            stale_now = self.env.stale_now(self.obs)
+                            if stale_now:
+                                # act() の計算中に入力の期限が切れた
+                                self.get_logger().error(
+                                    f"Inputs {stale_now} expired before sending; discarding episode {current_episode_number}.")
+                                self._stop_and_hold()
+                                episode_aborted = True
+                                break
                             obs_new = self.env.step(action)
+                            # 実際に送った姿勢も残す（指令ガードで制限した値。送らなかった周期は NaN）
+                            sent = getattr(self.robot, "last_sent_pose", None)
+                            action = dict(action, sent_ee_pose=np.full(7, np.nan) if sent is None else sent.copy())
                             action_replay.append(action)
                             obs_replay.append(self.obs) # Append obs before it's updated
                             self.obs = obs_new
                             message = f"Episode number: {current_episode_number} Time passed: {round(time.time() - st_episode, 2)}, Time for step: {round((time.time() - step_st)*1000,1)} ms"
                             self.get_logger().info(message)
 
+                        if episode_aborted:
+                            if SHUTDOWN_SIGNALLED.is_set():
+                                break
+                            self.button_state = "pass"
+                            continue
+                        if not obs_replay:
+                            # 1 ステップも記録しないうちに quit した。空のエピソードは保存も番号付けもしない
+                            self.get_logger().info("No steps recorded; not saving an episode.")
+                            if self.button_state == "quit":
+                                self.shutdown_requested = True
+                                break
+                            self.button_state = "pass"
+                            continue
                         self.get_logger().info("Episode done, saving now")
                         current_save_thread = threading.Thread(target=self.save_episode_thread, args=(current_episode_number, obs_replay, action_replay))
                         current_save_thread.start()
 
-                        self.button_state = "pass"
                         current_episode_number += 1
+                        if self.button_state == "quit":
+                            current_save_thread.join()
+                            self.shutdown_requested = True
+                            break
+                        self.button_state = "pass"
 
                     elif self.button_state == "pass":
                         
@@ -525,13 +714,14 @@ class AgentNode(Node):
 def signal_handler(sig, frame):
     """Handle shutdown signals gracefully"""
     print("\nShutdown signal received, cleaning up...")
+    SHUTDOWN_SIGNALLED.set()
     
 def main():
-    # Set up signal handlers for graceful shutdown
+    # rclpy のシグナルハンドラを使わない。使うと Ctrl+C で先に ROS の context が閉じ、cleanup で
+    # 姿勢の保持と Touch の力 0 を送れない。ここでは要求を記録し、各ループが止まってから cleanup する
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
-    rclpy.init()
     agent_node = None
     
     try:
@@ -542,7 +732,9 @@ def main():
     finally:
         if agent_node is not None:
             agent_node.cleanup()
-        rclpy.shutdown()
+        # Ctrl+C では rclpy のシグナルハンドラが先に shutdown していることがある
+        if rclpy.ok():
+            rclpy.shutdown()
         print("Shutdown complete")
 
 
