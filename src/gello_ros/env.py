@@ -168,6 +168,12 @@ class RobotEnv(Node):
         self._rate.sleep()
         return self.get_obs()
     
+    def stale_now(self, obs: Dict[str, Any]) -> List[str]:
+        """obs の入力のうち、今の時点で sensor_timeout_ms を超えたものの名前（観測を作ってからの経過時間を足す）。"""
+        elapsed_s = (self.get_clock().now().nanoseconds - obs["obs_time_ns"]) * 1e-9
+        stale = [name for name, age_s in obs["sensor_ages_s"].items() if age_s + elapsed_s > self.sensor_timeout_s]
+        return stale + [name for name in obs["stale_sensors"] if name not in stale]
+
     def wait_for_fresh_inputs(self, timeout_s: float = 2.0) -> Dict[str, Any]:
         """溜まっていたコールバックを処理し、入力が新しくなるまで最大 timeout_s 待って観測を返す。
 
@@ -214,16 +220,19 @@ class RobotEnv(Node):
         # 途切れた・遅れて届く入力（古い画像・力・joint state）を、ほかの入力と組み合わせて使わないよう、
         # 古い入力の名前を載せる（受信時刻と header.stamp の両方で判定）
         now_ns = self.get_clock().now().nanoseconds
-        stale = [
-            name for name in self.camera_names
-            if input_age_s(now_ns, self.camera_received_ns.get(name), self.camera_stamp_ns.get(name))
-            > self.sensor_timeout_s
-        ]
-        if observations.get("wrench_age_s", 0.0) > self.sensor_timeout_s:
-            stale.append("wrench")
+        ages_s = {
+            name: input_age_s(now_ns, self.camera_received_ns.get(name), self.camera_stamp_ns.get(name))
+            for name in self.camera_names
+        }
+        if "wrench_age_s" in observations:
+            ages_s["wrench"] = observations["wrench_age_s"]
+        stale = [name for name, age_s in ages_s.items() if age_s > self.sensor_timeout_s]
         if not observations.get("joint_state_fresh", True):
             stale.append("joint_states")
         observations["stale_sensors"] = stale
+        # 観測を作った時刻と各入力の古さ。方策の計算中に期限が切れていないかを、送る直前に stale_now() で確かめる
+        observations["obs_time_ns"] = now_ns
+        observations["sensor_ages_s"] = ages_s
         
         # Ensure essential keys are present
         assert "joint_positions" in observations

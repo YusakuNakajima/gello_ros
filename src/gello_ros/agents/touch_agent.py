@@ -6,7 +6,7 @@ import rclpy
 from geometry_msgs.msg import PoseStamped, WrenchStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from scipy.spatial.transform import Rotation as R
 from touch_msgs.msg import TouchButtonEvent, TouchFeedback
 
@@ -135,8 +135,11 @@ class TouchAgent(Agent, Node):
         self.pose_sub = self.create_subscription(
             PoseStamped, self.ee_pose_topic, self.pose_callback, qos_profile_sensor_data
         )
+        # ボタンは変化したときしか配信されないので、取りこぼさないよう reliable で受ける（touch_state は reliable, depth 100）。
+        # best-effort だと「離した」を落としたとき、押したままの扱いが続く
         self.button_sub = self.create_subscription(
-            TouchButtonEvent, self.button_topic, self.button_callback, qos_profile_sensor_data
+            TouchButtonEvent, self.button_topic, self.button_callback,
+            QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE)
         )
 
     def _setup_tf(self) -> None:
@@ -506,8 +509,8 @@ class TouchAgent(Agent, Node):
         if self.teleop_mode == "bilateral":
             # KDLベースのリアルタイム力覚変換を使用
             self.get_logger().debug(f"  - ee_wrench: {np.round(obs['ee_wrench'], 3)}")
-            if "wrench" in obs.get("stale_sensors", ()):
-                # 古い力を返し続けないよう、力センサの値が途切れている間は 0 を返す
+            if {"wrench", "joint_states"} & set(obs.get("stale_sensors", ())):
+                # 古い力、または古い関節角での座標変換（向きを誤る）で返し続けないよう、途切れている間は 0 を返す
                 wrench_vis, wrench_feedback = self._create_zero_wrench_messages()
             else:
                 wrench_vis, wrench_feedback = self.transform_wrench_kdl(

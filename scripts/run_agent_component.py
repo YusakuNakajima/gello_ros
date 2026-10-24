@@ -491,6 +491,10 @@ class AgentNode(Node):
                     if not self._move_home():
                         self.shutdown_requested = True
                         break
+                    # 1 回目の推論は GPU の初期化で遅く、その間に画像の期限が切れる。結果を捨てる推論を
+                    # 先に 1 回してから、観測を取り直して始める（t=0 でもう一度推論し直すので、結果は使われない）
+                    self.agent.act(self.obs, 0)
+                    self.obs = self.env.wait_for_fresh_inputs()
                     for t in range(self.number_of_steps):
                         time_passed = time.time() - start_time
                         step_st = time.time()
@@ -507,6 +511,14 @@ class AgentNode(Node):
                             self.shutdown_requested = True
                             break
                         action = self.agent.act(self.obs, t)
+                        stale_now = self.env.stale_now(self.obs)
+                        if stale_now:
+                            # 方策の計算中に入力の期限が切れた。古い観測から作った指令は送らない
+                            self.get_logger().error(
+                                f"Inputs {stale_now} expired before sending; stopping the policy and holding the measured pose.")
+                            self._stop_and_hold()
+                            self.shutdown_requested = True
+                            break
                         self.obs = self.env.step(action)
                         message = f"Agent {self.agent_type} Steps: {t} Time passed: {round(time_passed, 2)} Step: {t} Time for step: {round((time.time() - step_st)*1000,1)} ms"
                         self.get_logger().info(message)
@@ -526,8 +538,9 @@ class AgentNode(Node):
                             break
                         
                         if not self._move_home(update_agent=True):
-                            self.get_logger().error(f"Discarding episode {current_episode_number}: inputs went stale while moving home.")
-                            self.button_state = "pass"
+                            self.get_logger().error(f"Not recording episode {current_episode_number}: the move to the home pose stopped.")
+                            if self.button_state != "quit":  # quit なら次の周回で終了する
+                                self.button_state = "pass"
                             continue
                             
                         st_episode = time.time()
@@ -543,7 +556,9 @@ class AgentNode(Node):
                                 episode_aborted = True
                                 break
                             if self.button_state == "quit":
-                                self.get_logger().info("Quit command received during episode, stopping.")
+                                # ここまでを保存して終了する（テレオペには戻らない）
+                                self.get_logger().info("Quit command received during episode; saving it and exiting.")
+                                self._stop_and_hold()
                                 break
                             
                             step_st = time.time()
@@ -555,6 +570,14 @@ class AgentNode(Node):
                                 episode_aborted = True
                                 break
                             action = self.agent.act(self.obs)
+                            stale_now = self.env.stale_now(self.obs)
+                            if stale_now:
+                                # act() の計算中に入力の期限が切れた
+                                self.get_logger().error(
+                                    f"Inputs {stale_now} expired before sending; discarding episode {current_episode_number}.")
+                                self._stop_and_hold()
+                                episode_aborted = True
+                                break
                             obs_new = self.env.step(action)
                             # 実際に送った姿勢も残す（指令ガードで制限した値。送らなかった周期は NaN）
                             sent = getattr(self.robot, "last_sent_pose", None)
@@ -566,14 +589,20 @@ class AgentNode(Node):
                             self.get_logger().info(message)
 
                         if episode_aborted:
+                            if SHUTDOWN_SIGNALLED.is_set():
+                                break
                             self.button_state = "pass"
                             continue
                         self.get_logger().info("Episode done, saving now")
                         current_save_thread = threading.Thread(target=self.save_episode_thread, args=(current_episode_number, obs_replay, action_replay))
                         current_save_thread.start()
 
-                        self.button_state = "pass"
                         current_episode_number += 1
+                        if self.button_state == "quit":
+                            current_save_thread.join()
+                            self.shutdown_requested = True
+                            break
+                        self.button_state = "pass"
 
                     elif self.button_state == "pass":
                         
