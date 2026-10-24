@@ -6,7 +6,11 @@
     touch_force_feedback_topic: "/touch/force_feedback"
     touch_base_frame: "touch_base"
     touch_force_frame: "touch_force"  
-    teleoperation_mode: "bilateral" # "unilateral" or "bilateral"
+    # "unilateral"（力覚なし）か "bilateral"（力覚あり）。既定は unilateral。
+    # Touch ドライバ（touch_state）は最後に受け取った力を出し続け、受信が途切れても 0 にしない。
+    # このエージェントが異常終了・通信断すると力が残るので、ドライバ側で受信の期限切れを見るまでは、
+    # bilateral は人が Touch を持っている状態で明示的に選ぶ
+    teleoperation_mode: "unilateral"
     use_gripper: False
     use_FT_sensor: True
     touch_max_force: 3.3

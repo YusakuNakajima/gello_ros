@@ -28,6 +28,16 @@
   <!-- Kinematics dependencies -->
   <depend>kdl_parser</depend>
 
+  <!-- Packages used by the launch files and agents (onolab_ros2 FR3 + Touch setup) -->
+  <exec_depend>onolab_robot_description</exec_depend>
+  <exec_depend>touch_msgs</exec_depend>
+  <exec_depend>touch_description</exec_depend>
+  <exec_depend>touch_common</exec_depend>
+  <exec_depend>leptrino_force_torque</exec_depend>
+  <exec_depend>grinding_force_torque</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
   <!-- Build dependencies -->
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>ament_cmake_python</buildtool_depend>

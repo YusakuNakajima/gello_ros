@@ -93,7 +93,7 @@ class TouchAgent(Agent, Node):
         self.declare_parameter("touch_force_feedback_topic", "/touch/force_feedback")
         self.declare_parameter("touch_max_force", 1.5)
         self.declare_parameter("force_scale_to_touch", 1.0)
-        self.declare_parameter("teleoperation_mode", "bilateral")
+        self.declare_parameter("teleoperation_mode", "unilateral")  # 理由は config/common.yaml
         # Touch の姿勢がこれより古ければテレオペを止める（ms）。touch_state は 1 kHz で配信する
         self.declare_parameter("touch_timeout_ms", 100.0)
         self.declare_parameter("robot_base_frame", "base_link")

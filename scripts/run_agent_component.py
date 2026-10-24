@@ -45,6 +45,13 @@ import traceback
 SHUTDOWN_SIGNALLED = threading.Event()
 
 
+def abort_if_shutdown_signalled():
+    """起動中の移動（GELLO の初期移動など）で、指令を送る前に終了要求を確かめる。受けていれば初期化を中止する
+    （initialize_agent の except から cleanup して終了する）。"""
+    if SHUTDOWN_SIGNALLED.is_set():
+        raise RuntimeError("Shutdown requested during startup")
+
+
 class AgentNode(Node):
     def __init__(self, node_name='agent_node', **kwargs):
         super().__init__(node_name, **kwargs)
@@ -244,6 +251,7 @@ class AgentNode(Node):
                     max_delta = (np.abs(gello_curr_joints - gello_reset_joints)).max()
                     steps = min(int(max_delta / 0.01), 100)
                     for jnt in np.linspace(gello_curr_joints, gello_reset_joints, steps):
+                        abort_if_shutdown_signalled()
                         self.env.step({'joint_positions': jnt})
                         time.sleep(0.001)
 
@@ -287,6 +295,7 @@ class AgentNode(Node):
                     max_joint_delta = np.abs(delta).max()
                     if max_joint_delta > max_delta:
                         delta = delta / max_joint_delta * max_delta
+                    abort_if_shutdown_signalled()
                     self.obs = self.env.step({'joint_positions': current_joints + delta})
 
                 # check if the joints are close

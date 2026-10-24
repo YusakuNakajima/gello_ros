@@ -226,3 +226,16 @@ def test_stale_touch_sends_zero_feedback_even_if_robot_sensors_are_fresh():
     obs = dict(obs_at(0.4), ee_wrench=np.array([5.0, 0, 0, 0, 0, 0]))
     TouchAgent.act(agent, obs)
     assert len(sent) == 1 and sent[0] is zero[1]
+
+
+def test_startup_motion_aborts_after_a_shutdown_signal():
+    import pytest
+    module = load_runner()
+    module.SHUTDOWN_SIGNALLED.clear()
+    module.abort_if_shutdown_signalled()  # まだ要求なし → 何もしない
+    module.SHUTDOWN_SIGNALLED.set()
+    try:
+        with pytest.raises(RuntimeError):
+            module.abort_if_shutdown_signalled()
+    finally:
+        module.SHUTDOWN_SIGNALLED.clear()
