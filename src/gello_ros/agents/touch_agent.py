@@ -20,6 +20,15 @@ from kdl_parser_py.kdl_helper import KDLHelper
 # import tf2_geometry_msgs
 
 
+def limit_norm(vector: np.ndarray, max_norm: float) -> np.ndarray:
+    """ベクトルの大きさを max_norm 以下にする（向きは変えない）。"""
+    vector = np.asarray(vector, dtype=float)
+    norm = np.linalg.norm(vector)
+    if not np.isfinite(norm):
+        return np.zeros_like(vector)
+    return vector * (max_norm / norm) if norm > max_norm else vector
+
+
 def rotate_vector(rotation_matrix: np.ndarray, vector: np.ndarray) -> np.ndarray:
     """rotation_matrix（A 座標の姿勢を B 座標で表したもの）で、A 座標のベクトルを B 座標に移す。"""
     return np.asarray(rotation_matrix) @ np.asarray(vector)
@@ -369,6 +378,9 @@ class TouchAgent(Agent, Node):
             t_base_to_touch = self.wrench_static_transform[:3, 3]
             
             force_in_touch_frame = R_base_to_touch @ force_in_base
+            # 軸ごとの clip は座標変換で崩れる（45° 回すと一軸が √2 倍になる）ので、
+            # Touch に送る直前に合力の大きさを touch_max_force（N）以下にする
+            force_in_touch_frame = limit_norm(force_in_touch_frame, self.touch_max_force)
             torque_in_touch_frame = R_base_to_touch @ torque_in_base + np.cross(t_base_to_touch, force_in_touch_frame)
 
             # 5. RViz可視化用メッセージ (robot_base_frame座標系) を作成
@@ -393,6 +405,15 @@ class TouchAgent(Agent, Node):
         except Exception as e:
             self.get_logger().error(f"KDL力覚変換エラー: {e}")
             return self._create_zero_wrench_messages()
+
+    def cleanup(self) -> None:
+        """終了時に Touch の力を 0 にする（Touch ドライバは最後に受け取った力を出し続けるため）。"""
+        if not rclpy.ok():
+            return
+        _, zero_feedback = self._create_zero_wrench_messages()
+        for _ in range(3):
+            self.force_feedback_pub.publish(zero_feedback)
+            time.sleep(0.01)
 
     def _create_zero_wrench_messages(self) -> Tuple[WrenchStamped, TouchFeedback]:
         """ゼロレンチのメッセージを作成します。"""

@@ -78,6 +78,8 @@ class CartesianImpedanceControlRobot(Robot, Node):
         # 最後に送った指令姿勢と、その時刻（ROS 時刻、ns）
         self._last_command_pose = None
         self._last_command_ns = None
+        # 直近の指令で実際に送った姿勢（送らなかったら None）。記録用
+        self.last_sent_pose = None
         
         # 安全機能: 最後に有効だったjoint state (position, velocity, effort)
         self._last_valid_joint_positions = None
@@ -344,6 +346,7 @@ class CartesianImpedanceControlRobot(Robot, Node):
         return age_s * 1e9 <= self.joint_state_timeout_ns
 
     def _publish_pose(self, pose: np.ndarray) -> None:
+        self.last_sent_pose = np.array(pose, dtype=float)
         pose_stamped = PoseStamped()
         pose_stamped.header.stamp = self.get_clock().now().to_msg()
         pose_stamped.header.frame_id = self.robot_base_frame
@@ -366,6 +369,7 @@ class CartesianImpedanceControlRobot(Robot, Node):
                 "No fresh joint state / FK; cannot hold the measured pose. "
                 "The controller keeps the last target (within the tracking-error limit).")
             self._last_command_pose = None
+            self.last_sent_pose = None
             return False
         self._publish_pose(measured)
         self._last_command_pose = measured
@@ -382,6 +386,7 @@ class CartesianImpedanceControlRobot(Robot, Node):
         if measured is None:
             self.get_logger().warn("No fresh joint state / FK; not sending the pose command.", throttle_duration_sec=1)
             self._last_command_pose = None
+            self.last_sent_pose = None
             return
         if self._last_command_ns is None:
             dt_s = 0.0
@@ -391,6 +396,7 @@ class CartesianImpedanceControlRobot(Robot, Node):
         if limited is None:
             self.get_logger().warn(f"Invalid pose command {pose}; not sending it.", throttle_duration_sec=1)
             self._last_command_pose = None
+            self.last_sent_pose = None
             return
         self._last_command_pose = limited
         self._last_command_ns = now_ns

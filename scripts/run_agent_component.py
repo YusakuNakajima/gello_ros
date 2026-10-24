@@ -28,6 +28,8 @@ from gello_ros.policy.utils import *
 
 import rclpy
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
+from scipy.spatial.transform import Rotation as R
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.parameter import Parameter, ParameterType
 from rclpy.qos import qos_profile_sensor_data
@@ -37,6 +39,10 @@ from std_msgs.msg import String, Header
 import threading
 import traceback
 
+
+
+# SIGINT / SIGTERM を受けたら立てる（main の signal_handler）
+SHUTDOWN_SIGNALLED = threading.Event()
 
 
 class AgentNode(Node):
@@ -96,6 +102,12 @@ class AgentNode(Node):
         self.declare_parameter("save_episode_dir", "./episode_data")
         self.declare_parameter("task_name", "default")
         self.declare_parameter("robot_description", "")
+        # 方策の実行・エピソードの記録の前にホーム姿勢（robot_home_pose_with_touch）へ動かすか
+        self.declare_parameter("move_home_before_run", True)
+        # ホーム姿勢への移動の制限時間（s）と、到達とみなす差（m、rad）。暫定の推測値（模擬HWでのみ確認）
+        self.declare_parameter("home_move_timeout_s", 15.0)
+        self.declare_parameter("home_position_tolerance_m", 0.005)
+        self.declare_parameter("home_orientation_tolerance_rad", 0.05)
 
     def get_parameters(self):
         """Get all parameters from ROS2 parameter server"""
@@ -118,6 +130,10 @@ class AgentNode(Node):
         self.number_of_steps = self.get_parameter("number_of_steps").get_parameter_value().integer_value
         self.eval_ckpt_dir = self.get_parameter("eval_ckpt_dir").get_parameter_value().string_value
         self.robot_description = self.get_parameter("robot_description").get_parameter_value().string_value
+        self.move_home_before_run = self.get_parameter("move_home_before_run").get_parameter_value().bool_value
+        self.home_move_timeout_s = self.get_parameter("home_move_timeout_s").get_parameter_value().double_value
+        self.home_position_tolerance_m = self.get_parameter("home_position_tolerance_m").get_parameter_value().double_value
+        self.home_orientation_tolerance_rad = self.get_parameter("home_orientation_tolerance_rad").get_parameter_value().double_value
         
         # Mock is hardcoded to False for now
         self.mock = False
@@ -377,18 +393,47 @@ class AgentNode(Node):
         if hasattr(self.robot, 'hold_measured_pose'):
             self.robot.hold_measured_pose()
 
-    def _move_home(self, update_agent: bool = False) -> bool:
-        """ホーム姿勢へ 5 秒間指令を送る（指令ガードで速さを制限）。
+    def _stop_requested(self) -> bool:
+        """SIGINT/SIGTERM、または /GUI_button の quit を受けたか（AgentNode のコールバックを処理してから判定）。"""
+        rclpy.spin_once(self, timeout_sec=0.0)
+        return self.shutdown_requested or SHUTDOWN_SIGNALLED.is_set() or self.button_state == "quit"
 
-        入力（画像・力・joint state）が途切れたら、その場で止めて False を返す。
+    def _home_reached(self) -> bool:
+        home_pos = np.asarray(self.robot_home_pose_with_touch[:3])
+        home_rot = R.from_quat(self.robot_home_pose_with_touch[3:])
+        position_error = np.linalg.norm(np.asarray(self.obs["ee_pos"]) - home_pos)
+        angle_error = np.linalg.norm((R.from_quat(self.obs["ee_quat"]) * home_rot.inv()).as_rotvec())
+        return (position_error <= self.home_position_tolerance_m
+                and angle_error <= self.home_orientation_tolerance_rad)
+
+    def _move_home(self, update_agent: bool = False) -> bool:
+        """ホーム姿勢へ指令を送り（指令ガードで速さを制限）、計測姿勢が到達したら True を返す。
+
+        home_move_timeout_s 以内に届かない、入力（画像・力・joint state）が途切れた、終了要求を受けた場合は、
+        その場で止めて False を返す（方策の実行・記録を始めない）。move_home_before_run が false なら動かさない。
         """
+        if not self.move_home_before_run:
+            self.get_logger().warn("move_home_before_run is false; starting from the current pose.")
+            self.obs = self.env.wait_for_fresh_inputs()
+            return not self.obs["stale_sensors"]
         self.get_logger().info("Moving to the home pose...")
         action = {'ee_pos': self.robot_home_pose_with_touch[:3], 'ee_quat': self.robot_home_pose_with_touch[3:]}
         self.obs = self.env.wait_for_fresh_inputs()
-        for _ in range(self.hz * 5):  # Move for 5 seconds
+        deadline = time.monotonic() + self.home_move_timeout_s
+        while not self._home_reached():
             if self.obs["stale_sensors"]:
                 self.get_logger().error(
                     f"Stale inputs {self.obs['stale_sensors']}; stopping the move to the home pose.")
+                self._stop_and_hold()
+                return False
+            if self._stop_requested():
+                self.get_logger().info("Stop requested; stopping the move to the home pose.")
+                self._stop_and_hold()
+                return False
+            if time.monotonic() > deadline:
+                self.get_logger().error(
+                    f"Home pose not reached within {self.home_move_timeout_s} s "
+                    f"(now {np.round(self.obs['ee_pos'], 4)}); stopping.")
                 self._stop_and_hold()
                 return False
             self.obs = self.env.step(action)
@@ -435,7 +480,7 @@ class AgentNode(Node):
         message = ""
         
         try:
-            while rclpy.ok() and not self.shutdown_requested:
+            while rclpy.ok() and not self.shutdown_requested and not SHUTDOWN_SIGNALLED.is_set():
                 # Spin agent if it's a node (e.g., TouchAgent)
                 if self.agent_type in ["touch", "gello"]:
                     rclpy.spin_once(self.agent, timeout_sec=0.001)
@@ -449,6 +494,11 @@ class AgentNode(Node):
                     for t in range(self.number_of_steps):
                         time_passed = time.time() - start_time
                         step_st = time.time()
+                        if self._stop_requested():
+                            self.get_logger().info("Stop requested; holding the measured pose.")
+                            self._stop_and_hold()
+                            self.shutdown_requested = True
+                            break
                         if self.obs["stale_sensors"]:
                             # 途切れた画像・力で方策を動かし続けないよう、その場で止めて終了する
                             self.get_logger().error(
@@ -486,6 +536,12 @@ class AgentNode(Node):
                             rclpy.spin_once(self.agent, timeout_sec=0.001)
 
                             # Check if user wants to quit mid-episode
+                            rclpy.spin_once(self, timeout_sec=0.0)  # /GUI_button を処理する
+                            if SHUTDOWN_SIGNALLED.is_set():
+                                self.get_logger().info("Shutdown requested during episode; discarding it.")
+                                self._stop_and_hold()
+                                episode_aborted = True
+                                break
                             if self.button_state == "quit":
                                 self.get_logger().info("Quit command received during episode, stopping.")
                                 break
@@ -500,6 +556,9 @@ class AgentNode(Node):
                                 break
                             action = self.agent.act(self.obs)
                             obs_new = self.env.step(action)
+                            # 実際に送った姿勢も残す（指令ガードで制限した値。送らなかった周期は NaN）
+                            sent = getattr(self.robot, "last_sent_pose", None)
+                            action = dict(action, sent_ee_pose=np.full(7, np.nan) if sent is None else sent.copy())
                             action_replay.append(action)
                             obs_replay.append(self.obs) # Append obs before it's updated
                             self.obs = obs_new
@@ -566,13 +625,14 @@ class AgentNode(Node):
 def signal_handler(sig, frame):
     """Handle shutdown signals gracefully"""
     print("\nShutdown signal received, cleaning up...")
+    SHUTDOWN_SIGNALLED.set()
     
 def main():
-    # Set up signal handlers for graceful shutdown
+    # rclpy のシグナルハンドラを使わない。使うと Ctrl+C で先に ROS の context が閉じ、cleanup で
+    # 姿勢の保持と Touch の力 0 を送れない。ここでは要求を記録し、各ループが止まってから cleanup する
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
-    rclpy.init()
     agent_node = None
     
     try:

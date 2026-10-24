@@ -35,3 +35,13 @@ def test_sensor_force_is_rotated_into_base():
     np.testing.assert_allclose(
         [vis.wrench.force.x, vis.wrench.force.y, vis.wrench.force.z], [0.0, 1.0, 0.0], atol=1e-9)
     np.testing.assert_allclose([feedback.force.x, feedback.force.y, feedback.force.z], [0.0, 1.0, 0.0], atol=1e-9)
+
+
+def test_force_limit_is_applied_after_the_frame_change():
+    # センサ座標で各軸 3.3 N（clip 済み）でも、45° 回すと一軸 4.67 N になる。送る直前に合力で制限する
+    agent = fake_agent(R.from_euler('z', np.pi / 4).as_quat())
+    agent.touch_max_force = 3.3
+    _, feedback = TouchAgent.transform_wrench_kdl(agent, np.array([3.3, 3.3, 0, 0, 0, 0]), np.zeros(7))
+    force = np.array([feedback.force.x, feedback.force.y, feedback.force.z])
+    assert np.linalg.norm(force) <= 3.3 + 1e-9
+    assert np.all(np.abs(force) <= 3.3 + 1e-9)

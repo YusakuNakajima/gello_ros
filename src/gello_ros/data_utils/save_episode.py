@@ -39,6 +39,9 @@ def save_episode(node: Node, episode_number: int, obs_replay: List[Dict], action
         "/observations/joint_torques": [], "/observations/ee_pos": [],
         "/observations/ee_quat": [], "/observations/ee_rot_matrix": [],
         "/observations/ee_euler": [],
+        # 指令ガードで制限したあと、実際に controller に送った姿勢 [x,y,z,qx,qy,qz,qw]（送らなかった周期は NaN）。
+        # /action/ee_* はエージェントが出した目標（制限前）
+        "/action/sent_ee_pose": [],
     }
 
     # # カメラ画像を辞書に追加
@@ -56,6 +59,7 @@ def save_episode(node: Node, episode_number: int, obs_replay: List[Dict], action
         data_dict["/action/ee_quat"].append(a["ee_quat"])
         data_dict["/action/ee_rot_matrix"].append(a["ee_rot_matrix"])
         data_dict["/action/ee_euler"].append(a["ee_euler"])
+        data_dict["/action/sent_ee_pose"].append(a.get("sent_ee_pose", np.full(7, np.nan)))
         
         data_dict["/observations/joint_positions"].append(o["joint_positions"])
         data_dict["/observations/joint_velocities"].append(o["joint_velocities"])
@@ -107,6 +111,7 @@ def save_episode(node: Node, episode_number: int, obs_replay: List[Dict], action
         action.create_dataset("ee_quat", (max_timesteps, 4))
         action.create_dataset("ee_rot_matrix", (max_timesteps, 3, 3))
         action.create_dataset("ee_euler", (max_timesteps, 3))
+        action.create_dataset("sent_ee_pose", (max_timesteps, 7))
 
         if use_FT_sensor:
             obs.create_dataset("wrench", (max_timesteps, wrench_dim))
