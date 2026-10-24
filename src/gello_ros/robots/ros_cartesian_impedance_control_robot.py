@@ -67,8 +67,12 @@ class CartesianImpedanceControlRobot(Robot, Node):
         self._joint_positions = None
         self._joint_velocities = None
         self._joint_efforts = None
-        # joint state を最後に受信した時刻（ROS 時刻、ns）。古い計測で指令を出さないために使う
+        # joint state を最後に受信した時刻と、その header.stamp（どちらも ROS 時刻、ns）。
+        # 古い計測で指令を出さないために使う。stamp が 0 のメッセージは受信時刻だけで判定する
         self._joint_state_received_ns = None
+        self._joint_state_stamp_ns = None
+        # 力センサの値を最後に受信した時刻（ROS 時刻、ns）。観測に「何秒前の値か」を載せるために使う
+        self._wrench_received_ns = None
         # 最後に送った指令姿勢と、その時刻（ROS 時刻、ns）
         self._last_command_pose = None
         self._last_command_ns = None
@@ -243,6 +247,11 @@ class CartesianImpedanceControlRobot(Robot, Node):
         vel_dict = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
         eff_dict = dict(zip(msg.name, msg.effort)) if msg.effort else {}
 
+        stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        if stamp_ns != 0 and self._joint_state_stamp_ns and stamp_ns < self._joint_state_stamp_ns:
+            # 時刻が戻ったメッセージ（遅れて届いた・再送された）は使わない
+            self.get_logger().warn("JointState stamp went backwards; ignoring it.", throttle_duration_sec=5)
+            return
         missing = [name for name in self.joint_names_order if name not in pos_dict]
         if missing:
             # 欠けた関節を 0 で埋めると FK が別の姿勢を返すので、この joint state は使わない
@@ -259,6 +268,7 @@ class CartesianImpedanceControlRobot(Robot, Node):
         self._joint_velocities = ordered_vel
         self._joint_efforts = ordered_eff
         self._joint_state_received_ns = self.get_clock().now().nanoseconds
+        self._joint_state_stamp_ns = stamp_ns
 
         self._last_valid_joint_positions = self._joint_positions.copy()
         self._last_valid_joint_velocities = self._joint_velocities.copy()
@@ -267,6 +277,7 @@ class CartesianImpedanceControlRobot(Robot, Node):
     def wrench_callback(self, msg: WrenchStamped):
         """Wrench feedback callback"""
         self._wrench = msg
+        self._wrench_received_ns = self.get_clock().now().nanoseconds
 
     def num_dofs(self) -> int:
         return len(self.joint_names_order)
@@ -313,6 +324,9 @@ class CartesianImpedanceControlRobot(Robot, Node):
         if self._joint_state_received_ns is None or self._joint_positions is None:
             return None
         if now_ns - self._joint_state_received_ns > self.joint_state_timeout_ns:
+            return None
+        # 受信は新しくても、計測した時刻（header.stamp）が古い・未来なら使わない
+        if self._joint_state_stamp_ns and abs(now_ns - self._joint_state_stamp_ns) > self.joint_state_timeout_ns:
             return None
         try:
             return np.asarray(self.kdl_helper.forward_kinematics(self._joint_positions.tolist()), dtype=float)
@@ -395,6 +409,11 @@ class CartesianImpedanceControlRobot(Robot, Node):
             "ee_rot_matrix": rot_matrix,
             "ee_euler": euler_angles,
             "ee_wrench": wrench,
+            # 力センサの値が何秒前に届いたものか（一度も届いていなければ inf）
+            "wrench_age_s": (
+                (self.get_clock().now().nanoseconds - self._wrench_received_ns) * 1e-9
+                if self._wrench_received_ns is not None else float("inf")
+            ),
             "jacobian": jacobian,
         }
 

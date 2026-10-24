@@ -62,6 +62,11 @@ def limit_pose_command(target, previous_command, measured, dt_s, limits: PoseCom
     1. 前回送った目標（なければ計測姿勢）から、速度の上限 × dt_s までだけ target へ進める
     2. その結果を、計測姿勢から追従誤差の上限の範囲に引き戻す
 
+    2 は 1 より優先する。ロボットが前回の目標から追従誤差の上限以上ずれた（外力で押された、
+    追従できなかった）ときは、目標が 1 周期で速度の上限より大きく計測姿勢の側へ動く。
+    impedance 制御のばねの力は「目標 − 計測姿勢」に比例するので、引き戻すほうが力は小さくなる。
+    前回の目標を保つ・送るのをやめる（controller は前回の目標を保つ）と、上限より大きい差が残る。
+
     target・measured が無効（NaN・ノルム 0 の quaternion など）なら None を返す（送らない）。
     """
     target = normalized_pose(target)

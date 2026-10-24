@@ -39,6 +39,15 @@ def test_command_is_pulled_back_to_tracking_error():
     assert np.linalg.norm(out[:3] - measured[:3]) == pytest.approx(0.02)
 
 
+def test_tracking_error_takes_precedence_over_speed():
+    # ロボットが前回の目標から 30 mm ずれたら、速度の上限（0.1 mm）を超えてでも 20 mm 以内に戻す
+    previous = pose([0.400, 0.0, 0.3])
+    measured = pose([0.430, 0.0, 0.3])
+    out = limit_pose_command(previous, previous, measured, 0.001, LIMITS)
+    assert np.linalg.norm(out[:3] - measured[:3]) == pytest.approx(0.02)
+    assert out[0] == pytest.approx(0.410)
+
+
 def test_first_command_starts_from_measured_pose():
     measured = pose([0.4, 0.0, 0.3])
     target = pose([0.0, 0.0, 0.0])  # 原点（観測が 0 埋めだった場合など）

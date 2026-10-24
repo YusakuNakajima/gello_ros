@@ -19,6 +19,11 @@ from kdl_parser_py.kdl_helper import KDLHelper
 # import tf2_geometry_msgs
 
 
+def rotate_vector(rotation_matrix: np.ndarray, vector: np.ndarray) -> np.ndarray:
+    """rotation_matrix（A 座標の姿勢を B 座標で表したもの）で、A 座標のベクトルを B 座標に移す。"""
+    return np.asarray(rotation_matrix) @ np.asarray(vector)
+
+
 class TouchAgent(Agent, Node):
     """
     3D Systems Touchデバイスからの入力に基づき、ロボットアームを遠隔操作するエージェント。
@@ -329,15 +334,13 @@ class TouchAgent(Agent, Node):
             tool_quat = tool_pose[3:]  # [qx, qy, qz, qw]
             tool_pos = tool_pose[:3]
             
-            # base_linkからtool0への回転行列（forward）
-            R_base_to_tool = R.from_quat(tool_quat).as_matrix()
-            
-            # tool0からbase_linkへの回転行列（inverse）
-            R_tool_to_base = R_base_to_tool.T
+            # FK はセンサの姿勢を base 座標で返すので、その回転行列はセンサ座標のベクトルを base 座標に移す
+            #（v_base = R @ v_sensor）。転置するとセンサが回転しているときに力の向きが逆になる
+            R_tool_to_base = R.from_quat(tool_quat).as_matrix()
             
             # 力覚の座標変換（回転のみ、位置による影響は無視）
-            force_in_base = R_tool_to_base @ force_in_tool  
-            torque_in_base = R_tool_to_base @ torque_in_tool
+            force_in_base = rotate_vector(R_tool_to_base, force_in_tool)
+            torque_in_base = rotate_vector(R_tool_to_base, torque_in_tool)
             
             # 4. base_linkからtouch_force_frameへの静的変換を適用
             R_base_to_touch = self.wrench_static_transform[:3, :3]
@@ -433,6 +436,12 @@ class TouchAgent(Agent, Node):
             self.get_logger().warn("Touch device pose not available yet, using current robot pose")
             # Touchデバイスのポーズが利用できない場合は、テレオペを無効にする
             self._is_teleop_active = False
+        if self.pose_static_transform is None:
+            # touch_base -> robot_base のTFがないと Touch の動きをロボット座標に移せない。
+            # Z固定（灰ボタン）の姿勢上書きも含めて、テレオペを無効にする
+            self.get_logger().error(
+                "touch_base -> robot_base の静的TFがないため、テレオペを無効にしています", throttle_duration_sec=1.0)
+            self._is_teleop_active = False
         
         # デバッグ: 入力観測の確認
         self.get_logger().debug(f"TouchAgent act() called:")
@@ -444,10 +453,14 @@ class TouchAgent(Agent, Node):
         if self.teleop_mode == "bilateral":
             # KDLベースのリアルタイム力覚変換を使用
             self.get_logger().debug(f"  - ee_wrench: {np.round(obs['ee_wrench'], 3)}")
-            wrench_vis, wrench_feedback = self.transform_wrench_kdl(
-                obs["ee_wrench"], 
-                obs["joint_positions"]
-            )
+            if "wrench" in obs.get("stale_sensors", ()):
+                # 古い力を返し続けないよう、力センサの値が途切れている間は 0 を返す
+                wrench_vis, wrench_feedback = self._create_zero_wrench_messages()
+            else:
+                wrench_vis, wrench_feedback = self.transform_wrench_kdl(
+                    obs["ee_wrench"], 
+                    obs["joint_positions"]
+                )
             
             self.force_feedback_vis_pub.publish(wrench_vis)
             self.force_feedback_pub.publish(wrench_feedback)
@@ -463,11 +476,9 @@ class TouchAgent(Agent, Node):
             self._robot_start_pose_with_touch = self._touch_current_pose
             # self.get_logger().info("テレオペレーション開始")
         elif not self._is_teleop_active and self._was_teleop_active:
-            # ボタンを離した時点で、最後に計算された目標姿勢を保存（current_ee_poseではなく）
-            if self._last_target_pose is not None:
-                self._robot_current_pose = self._last_target_pose.copy()
-            else:
-                self._robot_current_pose = current_ee_pose
+            # ボタンを離したら、その時点の計測姿勢で止める。最後に計算した目標（指令ガードで制限する前）を
+            # 保つと、ロボットが追いついていない分だけ、離したあとも動き続ける
+            self._robot_current_pose = current_ee_pose.copy()
             # self.get_logger().info("テレオペレーション終了")
         
         self._was_teleop_active = self._is_teleop_active

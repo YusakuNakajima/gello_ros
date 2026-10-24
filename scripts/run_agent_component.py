@@ -426,6 +426,13 @@ class AgentNode(Node):
                     for t in range(self.number_of_steps):
                         time_passed = time.time() - start_time
                         step_st = time.time()
+                        if self.obs["stale_sensors"]:
+                            # 途切れた画像・力で方策を動かし続けないよう、その場で止めて終了する
+                            self.get_logger().error(
+                                f"Stale inputs {self.obs['stale_sensors']}; stopping the policy and holding the measured pose.")
+                            self.env.step({'ee_pos': self.obs['ee_pos'], 'ee_quat': self.obs['ee_quat']})
+                            self.shutdown_requested = True
+                            break
                         action = self.agent.act(self.obs, t)
                         self.obs = self.env.step(action)
                         message = f"Agent {self.agent_type} Steps: {t} Time passed: {round(time_passed, 2)} Step: {t} Time for step: {round((time.time() - step_st)*1000,1)} ms"
@@ -452,6 +459,7 @@ class AgentNode(Node):
                             self.agent.act(self.obs,force_pose_update=True)
                             
                         st_episode = time.time()
+                        episode_aborted = False
                         for i in range(self.number_of_steps):
                             rclpy.spin_once(self.agent, timeout_sec=0.001)
 
@@ -461,6 +469,12 @@ class AgentNode(Node):
                                 break
                             
                             step_st = time.time()
+                            if self.obs["stale_sensors"]:
+                                # 古い画像・力を新しい姿勢と組み合わせたエピソードを残さない
+                                self.get_logger().error(
+                                    f"Stale inputs {self.obs['stale_sensors']}; discarding episode {current_episode_number}.")
+                                episode_aborted = True
+                                break
                             action = self.agent.act(self.obs)
                             obs_new = self.env.step(action)
                             action_replay.append(action)
@@ -469,6 +483,9 @@ class AgentNode(Node):
                             message = f"Episode number: {current_episode_number} Time passed: {round(time.time() - st_episode, 2)}, Time for step: {round((time.time() - step_st)*1000,1)} ms"
                             self.get_logger().info(message)
 
+                        if episode_aborted:
+                            self.button_state = "pass"
+                            continue
                         self.get_logger().info("Episode done, saving now")
                         current_save_thread = threading.Thread(target=self.save_episode_thread, args=(current_episode_number, obs_replay, action_replay))
                         current_save_thread.start()

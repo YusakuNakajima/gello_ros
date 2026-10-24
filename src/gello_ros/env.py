@@ -87,6 +87,13 @@ class RobotEnv(Node):
         # Camera handling - Zero-copy mode
         self.camera_names = camera_names
         self.camera_images = {}  # Store Image messages directly for zero-copy
+        # カメラごとに最後に画像を受信した時刻（time.monotonic()、s）
+        self.camera_received_s = {}
+        # 画像・力センサの値がこれより古ければ、観測の stale_sensors に名前を入れる（ms）
+        self.declare_parameter("sensor_timeout_ms", 200.0)
+        self.sensor_timeout_s = self.get_parameter("sensor_timeout_ms").get_parameter_value().double_value * 1e-3
+        if not self.sensor_timeout_s > 0.0:
+            raise ValueError("sensor_timeout_ms must be > 0")
         self.latest_valid_images = {}  # Store latest valid numpy arrays as fallback
         if self.camera_names:
             self.start_camera_subscribers()
@@ -123,6 +130,7 @@ class RobotEnv(Node):
         # Store the Image message directly for zero-copy access
         # Image-to-numpy conversion will be done on-demand in get_obs()
         self.camera_images[camera_name] = msg
+        self.camera_received_s[camera_name] = time.monotonic()
 
     def robot(self) -> Robot:
         """Get the robot object.
@@ -181,6 +189,16 @@ class RobotEnv(Node):
         robot_obs = self._robot.get_observations()
         # It's safer to merge dictionaries
         observations.update(robot_obs)
+
+        # 途切れた入力（古い画像・力）を新しいロボット姿勢と組み合わせて使わないよう、古い入力の名前を載せる
+        now_s = time.monotonic()
+        stale = [
+            name for name in self.camera_names
+            if now_s - self.camera_received_s.get(name, float("-inf")) > self.sensor_timeout_s
+        ]
+        if observations.get("wrench_age_s", 0.0) > self.sensor_timeout_s:
+            stale.append("wrench")
+        observations["stale_sensors"] = stale
         
         # Ensure essential keys are present
         assert "joint_positions" in observations

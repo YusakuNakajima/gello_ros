@@ -18,6 +18,9 @@
     camera_width: 640
     camera_height: 480
     camera_fps: 30
+    # 画像・力センサの値がこれより古ければ、記録中のエピソードは捨て、方策の実行は止める（ms）。
+    # 暫定の推測値（2026-10-24、模擬HWのみ）。30 fps のカメラなら 6 フレーム分
+    sensor_timeout_ms: 200.0
 
     # imitation learning config
     task_name: "grinding_test"
