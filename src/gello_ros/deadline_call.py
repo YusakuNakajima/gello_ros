@@ -6,6 +6,7 @@ Python のスレッドは外から止められないので、期限を過ぎた�
 終了は待たない）。捨てたあとは同じ方策でもう推論しない（内部状態が途中のままのため）。
 """
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -28,10 +29,11 @@ def call_with_deadline(fn: Callable[[], Any], timeout_s: float,
                        poll_interval_s: float = 0.005) -> DeadlineResult:
     """fn() を別スレッドで呼び、終わるか、timeout_s（s）を過ぎるか、should_abort() が True になるまで待つ。
 
+    timeout_s を過ぎてから終わった結果は TIMEOUT として捨てる（遅れた指令を送らない）。
     fn が例外を投げたら、呼び出し元のスレッドで同じ例外を投げ直す。
     """
-    if not timeout_s > 0.0:
-        raise ValueError(f"timeout_s must be > 0, got {timeout_s}")
+    if not (math.isfinite(timeout_s) and timeout_s > 0.0):
+        raise ValueError(f"timeout_s must be a finite value > 0, got {timeout_s}")
     finished = threading.Event()
     outcome = {}
 
@@ -46,10 +48,13 @@ def call_with_deadline(fn: Callable[[], Any], timeout_s: float,
     start = time.monotonic()
     threading.Thread(target=worker, name="deadline_call", daemon=True).start()
     while True:
-        if finished.wait(timeout=poll_interval_s):
+        remaining_s = timeout_s - (time.monotonic() - start)
+        if finished.wait(timeout=max(0.0, min(poll_interval_s, remaining_s))):
             elapsed_s = time.monotonic() - start
             if "error" in outcome:
                 raise outcome["error"]
+            if elapsed_s > timeout_s:
+                return DeadlineResult(TIMEOUT, None, elapsed_s)
             return DeadlineResult(DONE, outcome.get("value"), elapsed_s)
         elapsed_s = time.monotonic() - start
         if should_abort is not None and should_abort():

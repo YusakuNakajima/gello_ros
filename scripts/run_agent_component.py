@@ -151,8 +151,8 @@ class AgentNode(Node):
         self.home_orientation_tolerance_rad = self.get_parameter("home_orientation_tolerance_rad").get_parameter_value().double_value
         self.policy_inference_timeout_s = self.get_parameter("policy_inference_timeout_ms").get_parameter_value().double_value * 1e-3
         self.policy_warmup_timeout_s = self.get_parameter("policy_warmup_timeout_s").get_parameter_value().double_value
-        if not (self.policy_inference_timeout_s > 0.0 and self.policy_warmup_timeout_s > 0.0):
-            raise ValueError("policy_inference_timeout_ms and policy_warmup_timeout_s must be > 0")
+        if not all(np.isfinite(v) and v > 0.0 for v in (self.policy_inference_timeout_s, self.policy_warmup_timeout_s)):
+            raise ValueError("policy_inference_timeout_ms and policy_warmup_timeout_s must be finite values > 0")
         
         # Mock is hardcoded to False for now
         self.mock = False

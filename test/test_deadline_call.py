@@ -41,7 +41,14 @@ def test_reraises_the_exception_from_the_call():
         call_with_deadline(fail, 1.0)
 
 
-@pytest.mark.parametrize("timeout_s", [0.0, -1.0, float("nan")])
+def test_a_result_after_the_deadline_is_discarded():
+    # 期限（1 ms）を過ぎてから終わった推論の結果は使わない
+    result = call_with_deadline(lambda: time.sleep(0.02) or 42, 0.001, poll_interval_s=0.05)
+    assert result.status == TIMEOUT
+    assert result.value is None
+
+
+@pytest.mark.parametrize("timeout_s", [0.0, -1.0, float("nan"), float("inf")])
 def test_timeout_must_be_positive(timeout_s):
     with pytest.raises(ValueError):
         call_with_deadline(lambda: None, timeout_s)
