@@ -4,6 +4,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from gello_ros.robots.robot import Robot
+from gello_ros.robots.pose_command_guard import PoseCommandLimits, limit_pose_command
 
 import rclpy
 from rclpy.node import Node
@@ -12,7 +13,6 @@ from geometry_msgs.msg import PoseStamped, WrenchStamped
 from std_srvs.srv import Empty
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from kdl_parser_py.kdl_helper import KDLHelper
-from pytracik.trac_ik import TracIK
 import time
 
 
@@ -67,6 +67,11 @@ class CartesianImpedanceControlRobot(Robot, Node):
         self._joint_positions = None
         self._joint_velocities = None
         self._joint_efforts = None
+        # joint state を最後に受信した時刻（ROS 時刻、ns）。古い計測で指令を出さないために使う
+        self._joint_state_received_ns = None
+        # 最後に送った指令姿勢と、その時刻（ROS 時刻、ns）
+        self._last_command_pose = None
+        self._last_command_ns = None
         
         # 安全機能: 最後に有効だったjoint state (position, velocity, effort)
         self._last_valid_joint_positions = None
@@ -155,18 +160,6 @@ class CartesianImpedanceControlRobot(Robot, Node):
         if self.kdl_helper is None:
             raise RuntimeError("KDL kinematics failed to initialize.")
 
-        # Initialize IK solver
-        try:
-            if urdf_string:
-                self.ik_solver = TracIK(base_link_name=self.robot_base_frame, tip_link_name=self.ee_link, urdf_string=urdf_string, timeout=0.05, epsilon=1e-5, solver_type="Distance")
-                self.get_logger().info("TracIK solver initialized successfully")
-            else:
-                self.ik_solver = None
-                self.get_logger().warn("No URDF string available. Proceeding without TracIK solver.")
-        except Exception as e:
-            self.get_logger().error(f"Failed to initialize TracIK solver: {e}")
-            self.ik_solver = None
-
         # Control parameters
         control_freq = 100
         self._min_traj_dur = 5.0 / control_freq
@@ -187,6 +180,15 @@ class CartesianImpedanceControlRobot(Robot, Node):
         self.declare_parameter("ee_link", "tool0")
         self.declare_parameter("robot_description_name", "/robot_description")
         self.declare_parameter("robot_description", "")
+        # 指令ガード（pose_command_guard）の上限。既定値は暫定の推測値（模擬HWでのみ確認）
+        self.declare_parameter("max_linear_speed_m_per_s", 0.1)
+        self.declare_parameter("max_angular_speed_rad_per_s", 0.5)
+        self.declare_parameter("max_tracking_error_m", 0.02)
+        self.declare_parameter("max_tracking_error_rad", 0.1)
+        # これより古い joint state しかないときは指令を出さない（ms）
+        self.declare_parameter("joint_state_timeout_ms", 100.0)
+        # 前回の指令からの経過時間として使う上限（s）。間が空いても、1 回に進める量をこれ以上にしない
+        self.declare_parameter("max_command_interval_s", 0.02)
 
     def get_parameters(self):
         """Get ROS2 parameters"""
@@ -201,6 +203,16 @@ class CartesianImpedanceControlRobot(Robot, Node):
         self.robot_base_frame = self.get_parameter("robot_base_frame").get_parameter_value().string_value
         self.ee_link = self.get_parameter("ee_link").get_parameter_value().string_value
         self.robot_description_name = self.get_parameter("robot_description_name").get_parameter_value().string_value
+        self.command_limits = PoseCommandLimits(
+            max_linear_speed_m_per_s=self.get_parameter("max_linear_speed_m_per_s").get_parameter_value().double_value,
+            max_angular_speed_rad_per_s=self.get_parameter("max_angular_speed_rad_per_s").get_parameter_value().double_value,
+            max_tracking_error_m=self.get_parameter("max_tracking_error_m").get_parameter_value().double_value,
+            max_tracking_error_rad=self.get_parameter("max_tracking_error_rad").get_parameter_value().double_value,
+        )
+        self.joint_state_timeout_ns = int(self.get_parameter("joint_state_timeout_ms").get_parameter_value().double_value * 1e6)
+        self.max_command_interval_s = self.get_parameter("max_command_interval_s").get_parameter_value().double_value
+        if self.joint_state_timeout_ns <= 0 or not self.max_command_interval_s > 0.0:
+            raise ValueError("joint_state_timeout_ms and max_command_interval_s must be > 0")
 
     def _log_topic_info(self) -> None:
         """Log publisher and subscriber topic information."""
@@ -216,6 +228,7 @@ class CartesianImpedanceControlRobot(Robot, Node):
         self.get_logger().info(f"  - robot_base_frame: {self.robot_base_frame}")
         self.get_logger().info(f"  - ee_link: {self.ee_link}")
         self.get_logger().info(f"  - joint_names_order: {self.joint_names_order}")
+        self.get_logger().info(f"  - command limits: {self.command_limits}")
         self.get_logger().info("================================================================")
 
     def joint_states_callback(self, msg: JointState):
@@ -230,13 +243,22 @@ class CartesianImpedanceControlRobot(Robot, Node):
         vel_dict = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
         eff_dict = dict(zip(msg.name, msg.effort)) if msg.effort else {}
 
-        ordered_pos = np.array([pos_dict.get(name, 0.0) for name in self.joint_names_order])
+        missing = [name for name in self.joint_names_order if name not in pos_dict]
+        if missing:
+            # 欠けた関節を 0 で埋めると FK が別の姿勢を返すので、この joint state は使わない
+            self.get_logger().warn(f"JointState is missing joints {missing}; ignoring it.", throttle_duration_sec=5)
+            return
+        ordered_pos = np.array([pos_dict[name] for name in self.joint_names_order])
+        if not np.all(np.isfinite(ordered_pos)):
+            self.get_logger().warn("JointState has a non-finite position; ignoring it.", throttle_duration_sec=5)
+            return
         ordered_vel = np.array([vel_dict.get(name, 0.0) for name in self.joint_names_order]) if vel_dict else np.zeros_like(ordered_pos)
         ordered_eff = np.array([eff_dict.get(name, 0.0) for name in self.joint_names_order]) if eff_dict else np.zeros_like(ordered_pos)
 
         self._joint_positions = ordered_pos
         self._joint_velocities = ordered_vel
         self._joint_efforts = ordered_eff
+        self._joint_state_received_ns = self.get_clock().now().nanoseconds
 
         self._last_valid_joint_positions = self._joint_positions.copy()
         self._last_valid_joint_velocities = self._joint_velocities.copy()
@@ -282,19 +304,46 @@ class CartesianImpedanceControlRobot(Robot, Node):
                 return
             
             pose = self.kdl_helper.forward_kinematics(joint_state.tolist())
-            pos, quat = pose[:3], pose[3:]
-            
-            pose_stamped = PoseStamped()
-            pose_stamped.header.stamp = self.get_clock().now().to_msg()
-            pose_stamped.header.frame_id = self.robot_base_frame
-            pose_stamped.pose.position.x, pose_stamped.pose.position.y, pose_stamped.pose.position.z = pos
-            pose_stamped.pose.orientation.x, pose_stamped.pose.orientation.y, pose_stamped.pose.orientation.z, pose_stamped.pose.orientation.w = quat
-            self.cartesian_command_publisher.publish(pose_stamped)
+            self.command_pose(np.asarray(pose, dtype=float))
         except Exception as e:
             self.get_logger().error(f"Failed to command joint state: {e}")
 
+    def _measured_pose(self, now_ns: int):
+        """新しい joint state から FK で計測姿勢を返す。joint state が古い・ない、FK に失敗した場合は None。"""
+        if self._joint_state_received_ns is None or self._joint_positions is None:
+            return None
+        if now_ns - self._joint_state_received_ns > self.joint_state_timeout_ns:
+            return None
+        try:
+            return np.asarray(self.kdl_helper.forward_kinematics(self._joint_positions.tolist()), dtype=float)
+        except Exception as e:
+            self.get_logger().error(f"Failed to compute FK: {e}", throttle_duration_sec=1)
+            return None
+
     def command_pose(self, pose: np.ndarray) -> None:
-        """Command the leader robot to a given pose."""
+        """目標姿勢を、速度と追従誤差の上限で制限してから controller に送る。
+
+        joint state が古い・FK に失敗した・目標が無効な場合は送らず、次に送るときは計測姿勢から始め直す。
+        """
+        now_ns = self.get_clock().now().nanoseconds
+        measured = self._measured_pose(now_ns)
+        if measured is None:
+            self.get_logger().warn("No fresh joint state / FK; not sending the pose command.", throttle_duration_sec=1)
+            self._last_command_pose = None
+            return
+        if self._last_command_ns is None:
+            dt_s = 0.0
+        else:
+            dt_s = min((now_ns - self._last_command_ns) * 1e-9, self.max_command_interval_s)
+        limited = limit_pose_command(pose, self._last_command_pose, measured, dt_s, self.command_limits)
+        if limited is None:
+            self.get_logger().warn(f"Invalid pose command {pose}; not sending it.", throttle_duration_sec=1)
+            self._last_command_pose = None
+            return
+        self._last_command_pose = limited
+        self._last_command_ns = now_ns
+        pose = limited
+
         pose_stamped = PoseStamped()
         pose_stamped.header.stamp = self.get_clock().now().to_msg()
         pose_stamped.header.frame_id = self.robot_base_frame

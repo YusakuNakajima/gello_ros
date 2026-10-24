@@ -34,7 +34,6 @@ from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Wrench, PoseStamped
 from sensor_msgs.msg import Image
 from std_msgs.msg import String, Header
-from cv_bridge import CvBridge
 import threading
 import traceback
 
@@ -48,7 +47,6 @@ class AgentNode(Node):
         self.agent = None
         self.camera_images = {}
         self.button_state = "pass"
-        self.bridge = CvBridge()
         self.shutdown_requested = False
         self.component_mode = kwargs.get('component_mode', False)
         
@@ -372,7 +370,10 @@ class AgentNode(Node):
             for _ in range(self.hz * 5):  # Move for 5 seconds
                 self.obs=self.env.step(action)
                 self.agent.act(self.obs,force_pose_update=True)
-                
+
+        # skip_initial_move のときも、ループの最初の act() に観測を渡せるようにする
+        if self.obs is None:
+            self.obs = self.env.get_obs()
 
     def save_episode_thread(self, episode_number, obs_replay, action_replay):
         """Thread function for saving episodes"""
@@ -542,7 +543,9 @@ def main():
     finally:
         if agent_node is not None:
             agent_node.cleanup()
-        rclpy.shutdown()
+        # Ctrl+C では rclpy のシグナルハンドラが先に shutdown していることがある
+        if rclpy.ok():
+            rclpy.shutdown()
         print("Shutdown complete")
 
 

@@ -15,13 +15,22 @@ if torch.cuda.is_available():
 os.environ["DEVICE"] = device
 
 
+# データの置き場所。onolab_ros2 ではリポジトリ直下の gello_data/（git 管理外）に置く。
+# 環境変数で上書きできる（GELLO_DATASET_DIR: 学習に使うエピソードのフォルダ、
+# GELLO_CHECKPOINT_DIR: チェックポイントの保存先、GELLO_NUM_EPOCHS: 学習エポック数）
+GELLO_DATA_ROOT = os.environ.get("GELLO_DATA_ROOT", "/home/ros/onolab_ros2/gello_data")
+
 # task config (you can add new tasks)
 TASK_CONFIG = {
     "task_name": "grinding_test",
-    "dataset_dir": "/home/ros/onolab_ros2/ros2_ws/src/gello_ros/scripts/episode_data/20250901_151810_grinding_test",
+    "dataset_dir": os.environ.get(
+        "GELLO_DATASET_DIR",
+        os.path.join(GELLO_DATA_ROOT, "episode_data", "20250901_151810_grinding_test"),
+    ),
     "state_dim": 12,
     "action_dim": 12,
-    "camera_names": ["bottom_camera_rgb"],
+    # hdf5 の /observations/images/ 以下のキー。save_episode は「<common.yaml の camera_names>_rgb」で保存する
+    "camera_names": ["bottom_rgb"],
 }
 
 
@@ -48,8 +57,10 @@ POLICY_CONFIG = {
 # training config
 TRAIN_CONFIG = {
     "seed": 42,
-    "num_epochs": 2000,  # number of training epochs
+    "num_epochs": int(os.environ.get("GELLO_NUM_EPOCHS", "2000")),  # number of training epochs
     "batch_size_val": 8,
     "batch_size_train": 8,
-    "checkpoint_dir": "/home/ros/onolab_ros2/ros2_ws/src/gello_ros/scripts/checkpoints",
+    "checkpoint_dir": os.environ.get(
+        "GELLO_CHECKPOINT_DIR", os.path.join(GELLO_DATA_ROOT, "checkpoints")
+    ),
 }

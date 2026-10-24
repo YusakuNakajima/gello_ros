@@ -410,10 +410,10 @@ class TouchAgent(Agent, Node):
             robot_relative_rot = R.from_matrix(robot_relative_rot_matrix)
             
         else:
-            # 静的変換が利用できない場合は直接使用（フォールバック）
-            self.get_logger().warn("静的変換が利用できないため、座標変換をスキップしています")
-            robot_pos_diff = touch_pos_diff
-            robot_relative_rot = touch_relative_rot
+            # 座標変換なしで動かすと、Touch とロボットで軸の向きが違う方向に動くので、開始姿勢のまま止める
+            self.get_logger().error(
+                "touch_base -> robot_base の静的TFがないため、テレオペで動かしません", throttle_duration_sec=1.0)
+            return np.asarray(robot_start, dtype=float).copy()
         
         # ロボットの新しい姿勢を計算
         robot_start_rot = R.from_quat(robot_start[3:])
