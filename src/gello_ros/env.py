@@ -9,6 +9,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 from gello_ros.robots.robot import Robot
+from gello_ros.freshness import input_age_s, stamp_to_ns, stamp_went_backwards
 
 
 def image_msg_to_numpy(msg: Image) -> np.ndarray:
@@ -87,8 +88,9 @@ class RobotEnv(Node):
         # Camera handling - Zero-copy mode
         self.camera_names = camera_names
         self.camera_images = {}  # Store Image messages directly for zero-copy
-        # カメラごとに最後に画像を受信した時刻（time.monotonic()、s）
-        self.camera_received_s = {}
+        # カメラごとに最後に画像を受信した時刻と、その header.stamp（ROS 時刻、ns）
+        self.camera_received_ns = {}
+        self.camera_stamp_ns = {}
         # 画像・力センサの値がこれより古ければ、観測の stale_sensors に名前を入れる（ms）
         self.declare_parameter("sensor_timeout_ms", 200.0)
         self.sensor_timeout_s = self.get_parameter("sensor_timeout_ms").get_parameter_value().double_value * 1e-3
@@ -129,8 +131,13 @@ class RobotEnv(Node):
         """Callback for the color image - Zero-copy mode: store Image message directly."""
         # Store the Image message directly for zero-copy access
         # Image-to-numpy conversion will be done on-demand in get_obs()
+        stamp_ns = stamp_to_ns(msg.header.stamp)
+        if stamp_went_backwards(self.camera_stamp_ns.get(camera_name), stamp_ns):
+            self.get_logger().warn(f"{camera_name}: image stamp went backwards; ignoring it.", throttle_duration_sec=5)
+            return
         self.camera_images[camera_name] = msg
-        self.camera_received_s[camera_name] = time.monotonic()
+        self.camera_received_ns[camera_name] = self.get_clock().now().nanoseconds
+        self.camera_stamp_ns[camera_name] = stamp_ns
 
     def robot(self) -> Robot:
         """Get the robot object.
@@ -144,8 +151,10 @@ class RobotEnv(Node):
         return 0
 
     def step(self, action: Dict[str, np.ndarray]) -> Dict[str, Any]:
-        
-        if self._control_mode == "cartesian":
+        if action.get("hold_measured", False):
+            # 止めるとき: 速度の上限を掛けずに、いまの計測姿勢を目標にする
+            self._robot.hold_measured_pose()
+        elif self._control_mode == "cartesian":
             # Ensure keys exist before accessing
             if "ee_pos" in action and "ee_quat" in action:
                 pos_quat = np.concatenate([action["ee_pos"], action["ee_quat"]])
@@ -159,6 +168,18 @@ class RobotEnv(Node):
         self._rate.sleep()
         return self.get_obs()
     
+    def wait_for_fresh_inputs(self, timeout_s: float = 2.0) -> Dict[str, Any]:
+        """溜まっていたコールバックを処理し、入力が新しくなるまで最大 timeout_s 待って観測を返す。
+
+        方策の読み込みなどで spin しない時間があると、最初に処理する画像は溜まっていた古いものになる。
+        """
+        deadline = time.monotonic() + timeout_s
+        obs = self.get_obs()
+        while obs["stale_sensors"] and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.01)
+            obs = self.get_obs()
+        return obs
+
     def get_obs(self) -> Dict[str, Any]:
         """Get observation from the environment."""
         # Only spin robot node to update robot states
@@ -190,14 +211,18 @@ class RobotEnv(Node):
         # It's safer to merge dictionaries
         observations.update(robot_obs)
 
-        # 途切れた入力（古い画像・力）を新しいロボット姿勢と組み合わせて使わないよう、古い入力の名前を載せる
-        now_s = time.monotonic()
+        # 途切れた・遅れて届く入力（古い画像・力・joint state）を、ほかの入力と組み合わせて使わないよう、
+        # 古い入力の名前を載せる（受信時刻と header.stamp の両方で判定）
+        now_ns = self.get_clock().now().nanoseconds
         stale = [
             name for name in self.camera_names
-            if now_s - self.camera_received_s.get(name, float("-inf")) > self.sensor_timeout_s
+            if input_age_s(now_ns, self.camera_received_ns.get(name), self.camera_stamp_ns.get(name))
+            > self.sensor_timeout_s
         ]
         if observations.get("wrench_age_s", 0.0) > self.sensor_timeout_s:
             stale.append("wrench")
+        if not observations.get("joint_state_fresh", True):
+            stale.append("joint_states")
         observations["stale_sensors"] = stale
         
         # Ensure essential keys are present

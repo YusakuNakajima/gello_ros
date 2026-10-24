@@ -12,6 +12,7 @@ from touch_msgs.msg import TouchButtonEvent, TouchFeedback
 
 import tf2_ros
 from gello_ros.agents.agent import Agent
+from gello_ros.freshness import input_age_s, stamp_to_ns, stamp_went_backwards
 from kdl_parser_py.kdl_helper import KDLHelper
 
 # tf2_geometry_msgsはPoseやWrenchの変換に便利ですが、
@@ -54,6 +55,12 @@ class TouchAgent(Agent, Node):
         self._is_teleop_active = False  # 白ボタンが押されているか
         self._was_teleop_active = False # 前のステップで白ボタンが押されていたか
         self._is_z_lock_active = False  # 灰ボタンが押されているか
+        # Touch の姿勢を最後に受信した時刻と header.stamp（ROS 時刻、ns）。ドライバが止まったことを検出する
+        self._touch_received_ns: int | None = None
+        self._touch_stamp_ns: int | None = None
+        # Touch が途切れたあとは、白ボタンをいったん離すまでテレオペを再開しない
+        #（ボタンは変化したときしか配信されないので、押したままの状態が残り続けないようにする）
+        self._needs_rearm = False
         
         # Z軸下向きの回転（固定値）
         self.z_down_quat = R.from_euler('xyz', [0, np.pi, 0]).as_quat()
@@ -78,6 +85,8 @@ class TouchAgent(Agent, Node):
         self.declare_parameter("touch_max_force", 1.5)
         self.declare_parameter("force_scale_to_touch", 1.0)
         self.declare_parameter("teleoperation_mode", "bilateral")
+        # Touch の姿勢がこれより古ければテレオペを止める（ms）。touch_state は 1 kHz で配信する
+        self.declare_parameter("touch_timeout_ms", 100.0)
         self.declare_parameter("robot_base_frame", "base_link")
         self.declare_parameter("touch_base_frame", "touch_base")
         self.declare_parameter("touch_force_frame", "touch_force_frame")
@@ -90,6 +99,9 @@ class TouchAgent(Agent, Node):
         self.touch_max_force = self.get_parameter("touch_max_force").get_parameter_value().double_value
         self.force_scale_to_touch = self.get_parameter("force_scale_to_touch").get_parameter_value().double_value
         self.teleop_mode = self.get_parameter("teleoperation_mode").get_parameter_value().string_value
+        self.touch_timeout_s = self.get_parameter("touch_timeout_ms").get_parameter_value().double_value * 1e-3
+        if not self.touch_timeout_s > 0.0:
+            raise ValueError("touch_timeout_ms must be > 0")
         self.robot_base_frame = self.get_parameter("robot_base_frame").get_parameter_value().string_value
         self.touch_base_frame = self.get_parameter("touch_base_frame").get_parameter_value().string_value
         self.touch_force_frame = self.get_parameter("touch_force_frame").get_parameter_value().string_value
@@ -292,6 +304,13 @@ class TouchAgent(Agent, Node):
             self.get_logger().warn("Touchデバイスからのquaternionが無効です。このメッセージを無視します。")
             return
         
+        stamp_ns = stamp_to_ns(msg.header.stamp)
+        if stamp_went_backwards(self._touch_stamp_ns, stamp_ns):
+            self.get_logger().warn("Touch pose stamp went backwards; ignoring it.", throttle_duration_sec=5)
+            return
+        self._touch_received_ns = self.get_clock().now().nanoseconds
+        self._touch_stamp_ns = stamp_ns
+
         # 有効なquaternionを正規化
         quat = quat / np.linalg.norm(quat)
         self._touch_current_pose = np.array([
@@ -302,7 +321,10 @@ class TouchAgent(Agent, Node):
 
     def button_callback(self, msg: TouchButtonEvent) -> None:
         """Touchデバイスのボタン状態を購読し、フラグを更新します。"""
-        self._is_teleop_active = (msg.white_button == 1)
+        if msg.white_button == 0:
+            self._needs_rearm = False
+        # Touch が途切れたあとは、いったん離して押し直すまで有効にしない
+        self._is_teleop_active = (msg.white_button == 1) and not self._needs_rearm
         self._is_z_lock_active = (msg.grey_button == 1)
         self.get_logger().debug(f"Received Button event: white_button={msg.white_button}, grey_button={msg.grey_button}")
         
@@ -430,12 +452,22 @@ class TouchAgent(Agent, Node):
         観測(obs)に基づいて行動(action)を決定します。
         """
         current_ee_pose = np.concatenate((obs["ee_pos"], obs["ee_quat"]))
+        released = False
         
         # 危険な入力データの検証
         if self._touch_current_pose is None:
             self.get_logger().warn("Touch device pose not available yet, using current robot pose")
             # Touchデバイスのポーズが利用できない場合は、テレオペを無効にする
             self._is_teleop_active = False
+        touch_age_s = input_age_s(
+            self.get_clock().now().nanoseconds, self._touch_received_ns, self._touch_stamp_ns)
+        if touch_age_s > self.touch_timeout_s and self._is_teleop_active:
+            # Touch ドライバが止まった・遅れている。最後の姿勢と押下状態で動かし続けないよう、
+            # 離したのと同じ扱いで止め、押し直すまで再開しない
+            self.get_logger().error(
+                f"Touch pose is {touch_age_s:.3f} s old; stopping teleop until the white button is released and pressed again.")
+            self._is_teleop_active = False
+            self._needs_rearm = True
         if self.pose_static_transform is None:
             # touch_base -> robot_base のTFがないと Touch の動きをロボット座標に移せない。
             # Z固定（灰ボタン）の姿勢上書きも含めて、テレオペを無効にする
@@ -458,7 +490,7 @@ class TouchAgent(Agent, Node):
                 wrench_vis, wrench_feedback = self._create_zero_wrench_messages()
             else:
                 wrench_vis, wrench_feedback = self.transform_wrench_kdl(
-                    obs["ee_wrench"], 
+                    obs["ee_wrench"],
                     obs["joint_positions"]
                 )
             
@@ -479,6 +511,7 @@ class TouchAgent(Agent, Node):
             # ボタンを離したら、その時点の計測姿勢で止める。最後に計算した目標（指令ガードで制限する前）を
             # 保つと、ロボットが追いついていない分だけ、離したあとも動き続ける
             self._robot_current_pose = current_ee_pose.copy()
+            released = True
             # self.get_logger().info("テレオペレーション終了")
         
         self._was_teleop_active = self._is_teleop_active
@@ -524,7 +557,9 @@ class TouchAgent(Agent, Node):
             "ee_pos": target_pose[:3],
             "ee_quat": target_quat,
             "ee_rot_matrix": R.from_quat(target_quat).as_matrix(),
-            "ee_euler": R.from_quat(target_quat).as_euler('xyz')
+            "ee_euler": R.from_quat(target_quat).as_euler('xyz'),
+            # 離した周期だけ、速度の上限を掛けずに計測姿勢で止める（RobotEnv.step が見る）
+            "hold_measured": released,
         }
         
         # デバッグ: 最終アクション結果を表示

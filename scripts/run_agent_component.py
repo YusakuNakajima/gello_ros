@@ -365,15 +365,36 @@ class AgentNode(Node):
 
         # Move the robot to the configured home pose if not skipping
         if not self.skip_initial_move:
-            self.get_logger().info("Moving to the home pose...")
-            action = {'ee_pos': self.robot_home_pose_with_touch[:3], 'ee_quat': self.robot_home_pose_with_touch[3:]}
-            for _ in range(self.hz * 5):  # Move for 5 seconds
-                self.obs=self.env.step(action)
-                self.agent.act(self.obs,force_pose_update=True)
+            if not self._move_home(update_agent=True):
+                raise RuntimeError("Inputs went stale during the initial move to the home pose")
 
         # skip_initial_move のときも、ループの最初の act() に観測を渡せるようにする
         if self.obs is None:
             self.obs = self.env.get_obs()
+
+    def _stop_and_hold(self):
+        """速度の上限を掛けずに、いまの計測姿勢を目標にして止める。"""
+        if hasattr(self.robot, 'hold_measured_pose'):
+            self.robot.hold_measured_pose()
+
+    def _move_home(self, update_agent: bool = False) -> bool:
+        """ホーム姿勢へ 5 秒間指令を送る（指令ガードで速さを制限）。
+
+        入力（画像・力・joint state）が途切れたら、その場で止めて False を返す。
+        """
+        self.get_logger().info("Moving to the home pose...")
+        action = {'ee_pos': self.robot_home_pose_with_touch[:3], 'ee_quat': self.robot_home_pose_with_touch[3:]}
+        self.obs = self.env.wait_for_fresh_inputs()
+        for _ in range(self.hz * 5):  # Move for 5 seconds
+            if self.obs["stale_sensors"]:
+                self.get_logger().error(
+                    f"Stale inputs {self.obs['stale_sensors']}; stopping the move to the home pose.")
+                self._stop_and_hold()
+                return False
+            self.obs = self.env.step(action)
+            if update_agent:
+                self.agent.act(self.obs, force_pose_update=True)
+        return True
 
     def save_episode_thread(self, episode_number, obs_replay, action_replay):
         """Thread function for saving episodes"""
@@ -385,6 +406,9 @@ class AgentNode(Node):
         try:
             if hasattr(self, 'robot') and self.robot is not None:
                 self.get_logger().info("Stopping robot...")
+                # 終了後も controller は最後の目標を保つので、計測姿勢に合わせてから終わる
+                if rclpy.ok() and hasattr(self.robot, 'hold_measured_pose'):
+                    self.robot.hold_measured_pose()
                 
             if hasattr(self, 'agent') and self.agent is not None:
                 self.get_logger().info("Cleaning up agent...")
@@ -419,10 +443,9 @@ class AgentNode(Node):
                 if self.agent_type in ["act", "comp_act"]:
                     if self.obs is None:
                         self.obs = self.env.get_obs()
-                    self.get_logger().info("Moving to the home pose...")
-                    action = {'ee_pos': self.robot_home_pose_with_touch[:3], 'ee_quat': self.robot_home_pose_with_touch[3:]}
-                    for _ in range(self.hz * 5):  # Move for 5 seconds
-                        self.obs=self.env.step(action)
+                    if not self._move_home():
+                        self.shutdown_requested = True
+                        break
                     for t in range(self.number_of_steps):
                         time_passed = time.time() - start_time
                         step_st = time.time()
@@ -430,7 +453,7 @@ class AgentNode(Node):
                             # 途切れた画像・力で方策を動かし続けないよう、その場で止めて終了する
                             self.get_logger().error(
                                 f"Stale inputs {self.obs['stale_sensors']}; stopping the policy and holding the measured pose.")
-                            self.env.step({'ee_pos': self.obs['ee_pos'], 'ee_quat': self.obs['ee_quat']})
+                            self._stop_and_hold()
                             self.shutdown_requested = True
                             break
                         action = self.agent.act(self.obs, t)
@@ -452,11 +475,10 @@ class AgentNode(Node):
                             self.get_logger().info("All episodes done")
                             break
                         
-                        self.get_logger().info("Moving to the home pose...")
-                        action = {'ee_pos': self.robot_home_pose_with_touch[:3], 'ee_quat': self.robot_home_pose_with_touch[3:]}
-                        for _ in range(self.hz * 5):  # Move for 5 seconds
-                            self.obs=self.env.step(action)
-                            self.agent.act(self.obs,force_pose_update=True)
+                        if not self._move_home(update_agent=True):
+                            self.get_logger().error(f"Discarding episode {current_episode_number}: inputs went stale while moving home.")
+                            self.button_state = "pass"
+                            continue
                             
                         st_episode = time.time()
                         episode_aborted = False
@@ -473,6 +495,7 @@ class AgentNode(Node):
                                 # 古い画像・力を新しい姿勢と組み合わせたエピソードを残さない
                                 self.get_logger().error(
                                     f"Stale inputs {self.obs['stale_sensors']}; discarding episode {current_episode_number}.")
+                                self._stop_and_hold()
                                 episode_aborted = True
                                 break
                             action = self.agent.act(self.obs)

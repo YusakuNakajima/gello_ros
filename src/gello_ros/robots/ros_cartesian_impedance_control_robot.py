@@ -4,7 +4,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from gello_ros.robots.robot import Robot
-from gello_ros.robots.pose_command_guard import PoseCommandLimits, limit_pose_command
+from gello_ros.robots.pose_command_guard import PoseCommandLimits, limit_pose_command, normalized_pose
+from gello_ros.freshness import input_age_s, stamp_to_ns, stamp_went_backwards
 
 import rclpy
 from rclpy.node import Node
@@ -71,8 +72,9 @@ class CartesianImpedanceControlRobot(Robot, Node):
         # 古い計測で指令を出さないために使う。stamp が 0 のメッセージは受信時刻だけで判定する
         self._joint_state_received_ns = None
         self._joint_state_stamp_ns = None
-        # 力センサの値を最後に受信した時刻（ROS 時刻、ns）。観測に「何秒前の値か」を載せるために使う
+        # 力センサの値を最後に受信した時刻と、その header.stamp（ROS 時刻、ns）。観測に「何秒前の値か」を載せる
         self._wrench_received_ns = None
+        self._wrench_stamp_ns = None
         # 最後に送った指令姿勢と、その時刻（ROS 時刻、ns）
         self._last_command_pose = None
         self._last_command_ns = None
@@ -247,8 +249,8 @@ class CartesianImpedanceControlRobot(Robot, Node):
         vel_dict = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
         eff_dict = dict(zip(msg.name, msg.effort)) if msg.effort else {}
 
-        stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-        if stamp_ns != 0 and self._joint_state_stamp_ns and stamp_ns < self._joint_state_stamp_ns:
+        stamp_ns = stamp_to_ns(msg.header.stamp)
+        if stamp_went_backwards(self._joint_state_stamp_ns, stamp_ns):
             # 時刻が戻ったメッセージ（遅れて届いた・再送された）は使わない
             self.get_logger().warn("JointState stamp went backwards; ignoring it.", throttle_duration_sec=5)
             return
@@ -276,8 +278,13 @@ class CartesianImpedanceControlRobot(Robot, Node):
 
     def wrench_callback(self, msg: WrenchStamped):
         """Wrench feedback callback"""
+        stamp_ns = stamp_to_ns(msg.header.stamp)
+        if stamp_went_backwards(self._wrench_stamp_ns, stamp_ns):
+            self.get_logger().warn("Wrench stamp went backwards; ignoring it.", throttle_duration_sec=5)
+            return
         self._wrench = msg
         self._wrench_received_ns = self.get_clock().now().nanoseconds
+        self._wrench_stamp_ns = stamp_ns
 
     def num_dofs(self) -> int:
         return len(self.joint_names_order)
@@ -321,18 +328,49 @@ class CartesianImpedanceControlRobot(Robot, Node):
 
     def _measured_pose(self, now_ns: int):
         """新しい joint state から FK で計測姿勢を返す。joint state が古い・ない、FK に失敗した場合は None。"""
-        if self._joint_state_received_ns is None or self._joint_positions is None:
-            return None
-        if now_ns - self._joint_state_received_ns > self.joint_state_timeout_ns:
-            return None
-        # 受信は新しくても、計測した時刻（header.stamp）が古い・未来なら使わない
-        if self._joint_state_stamp_ns and abs(now_ns - self._joint_state_stamp_ns) > self.joint_state_timeout_ns:
+        if not self._joint_state_fresh(now_ns):
             return None
         try:
             return np.asarray(self.kdl_helper.forward_kinematics(self._joint_positions.tolist()), dtype=float)
         except Exception as e:
             self.get_logger().error(f"Failed to compute FK: {e}", throttle_duration_sec=1)
             return None
+
+    def _joint_state_fresh(self, now_ns: int) -> bool:
+        """joint state が joint_state_timeout_ms 以内か（受信時刻と header.stamp の両方で判定）。"""
+        if self._joint_positions is None:
+            return False
+        age_s = input_age_s(now_ns, self._joint_state_received_ns, self._joint_state_stamp_ns)
+        return age_s * 1e9 <= self.joint_state_timeout_ns
+
+    def _publish_pose(self, pose: np.ndarray) -> None:
+        pose_stamped = PoseStamped()
+        pose_stamped.header.stamp = self.get_clock().now().to_msg()
+        pose_stamped.header.frame_id = self.robot_base_frame
+        pose_stamped.pose.position.x, pose_stamped.pose.position.y, pose_stamped.pose.position.z = pose[:3]
+        pose_stamped.pose.orientation.x, pose_stamped.pose.orientation.y, pose_stamped.pose.orientation.z, pose_stamped.pose.orientation.w = pose[3:]
+        self.cartesian_command_publisher.publish(pose_stamped)
+
+    def hold_measured_pose(self) -> bool:
+        """いまの計測姿勢をそのまま目標として送り、その場で止める（速度の上限は掛けない）。
+
+        目標を計測姿勢に合わせるので、impedance のばねの力は 0 になる。止める・終了するときに使う。
+        新しい計測がない（joint state が古い・FK 失敗）場合は送れないので False を返す。
+        そのとき controller は最後の目標（計測姿勢から追従誤差の上限以内）を保ち続ける。
+        """
+        now_ns = self.get_clock().now().nanoseconds
+        measured = self._measured_pose(now_ns)
+        measured = normalized_pose(measured) if measured is not None else None
+        if measured is None:
+            self.get_logger().error(
+                "No fresh joint state / FK; cannot hold the measured pose. "
+                "The controller keeps the last target (within the tracking-error limit).")
+            self._last_command_pose = None
+            return False
+        self._publish_pose(measured)
+        self._last_command_pose = measured
+        self._last_command_ns = now_ns
+        return True
 
     def command_pose(self, pose: np.ndarray) -> None:
         """目標姿勢を、速度と追従誤差の上限で制限してから controller に送る。
@@ -356,14 +394,7 @@ class CartesianImpedanceControlRobot(Robot, Node):
             return
         self._last_command_pose = limited
         self._last_command_ns = now_ns
-        pose = limited
-
-        pose_stamped = PoseStamped()
-        pose_stamped.header.stamp = self.get_clock().now().to_msg()
-        pose_stamped.header.frame_id = self.robot_base_frame
-        pose_stamped.pose.position.x, pose_stamped.pose.position.y, pose_stamped.pose.position.z = pose[:3]
-        pose_stamped.pose.orientation.x, pose_stamped.pose.orientation.y, pose_stamped.pose.orientation.z, pose_stamped.pose.orientation.w = pose[3:]
-        self.cartesian_command_publisher.publish(pose_stamped)
+        self._publish_pose(limited)
 
     def get_observations(self) -> Dict[str, np.ndarray]:
         """Get robot observations including kinematics and sensor data"""
@@ -409,11 +440,11 @@ class CartesianImpedanceControlRobot(Robot, Node):
             "ee_rot_matrix": rot_matrix,
             "ee_euler": euler_angles,
             "ee_wrench": wrench,
-            # 力センサの値が何秒前に届いたものか（一度も届いていなければ inf）
-            "wrench_age_s": (
-                (self.get_clock().now().nanoseconds - self._wrench_received_ns) * 1e-9
-                if self._wrench_received_ns is not None else float("inf")
-            ),
+            # 力センサの値が何秒前のものか（受信時刻と header.stamp。一度も届いていなければ inf）
+            "wrench_age_s": input_age_s(
+                self.get_clock().now().nanoseconds, self._wrench_received_ns, self._wrench_stamp_ns),
+            # joint state（と、それから計算した手先姿勢）が joint_state_timeout_ms 以内か
+            "joint_state_fresh": self._joint_state_fresh(self.get_clock().now().nanoseconds),
             "jacobian": jacobian,
         }
 

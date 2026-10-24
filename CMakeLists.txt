@@ -60,6 +60,9 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_touch_force_frame test/test_touch_force_frame.py
     APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src
   )
+  ament_add_pytest_test(test_freshness test/test_freshness.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
 endif()
 
 ament_package()
