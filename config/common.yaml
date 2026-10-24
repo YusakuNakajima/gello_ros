@@ -7,9 +7,9 @@
     touch_base_frame: "touch_base"
     touch_force_frame: "touch_force"  
     # "unilateral"（力覚なし）か "bilateral"（力覚あり）。既定は unilateral。
-    # Touch ドライバ（touch_state）は最後に受け取った力を出し続け、受信が途切れても 0 にしない。
-    # このエージェントが異常終了・通信断すると力が残るので、ドライバ側で受信の期限切れを見るまでは、
-    # bilateral は人が Touch を持っている状態で明示的に選ぶ
+    # Touch ドライバ（touch_state）は、force_timeout_ms パラメータを持つ版（quantumbeam/3DSystems_Touch_ROS_Drivers、2026-10-24 以降）なら、
+    # force_timeout_ms（既定 100 ms）新しい力が届かなければ 0 にする。それより前のドライバは最後の力を出し続ける。
+    # bilateral は人が Touch を持っている状態で明示的に選ぶ（実機の Touch では未確認のため既定は変えない）
     teleoperation_mode: "unilateral"
     use_gripper: False
     use_FT_sensor: True
@@ -34,6 +34,10 @@
     eval_ckpt_dir: "/home/ros/onolab_ros2/gello_data/checkpoints/20250901_172954_grinding_test"
     number_of_episodes: 10 # trials
     number_of_steps: 10000 # steps for each episode
+    # 方策の推論 1 回の制限時間（ms）。過ぎたらその場で止めて終了する。暫定（模擬HWのみ。この GPU では最大 13.5 ms）
+    policy_inference_timeout_ms: 200.0
+    # 最初の 1 回（GPU の初期化を含む、結果は捨てる）の制限時間（s）。暫定
+    policy_warmup_timeout_s: 60.0
     control_mode: "cartesian" # "joint" or "cartesian"
     pose_representation: "euler" # "euler" or "rotation_matrix"
     state_dim: 12
