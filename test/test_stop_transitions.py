@@ -110,7 +110,7 @@ def fake_impedance_robot(samples):
     robot = SimpleNamespace(
         joint_state_timeout_ns=100_000_000, _joint_positions=np.zeros(7),
         _joint_state_received_ns=None, _joint_state_stamp_ns=None, _x=None,
-        _last_command_pose=None, _last_command_ns=None, last_sent_pose=None,
+        _last_command_pose=None, _last_command_ns=None, last_sent_pose=None, hold_pending=False,
     )
     ros_now = {"ns": 10_000_000_000}
     robot.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=ros_now["ns"]))
@@ -147,3 +147,33 @@ def test_hold_fails_without_a_new_stamped_sample(monkeypatch):
     monkeypatch.setattr(mod.rclpy, "ok", lambda: True)
     assert not Robot.hold_measured_pose(robot)
     assert published == []
+    # 止められなかったことを覚えておき、あとで止め直す
+    assert robot.hold_pending
+
+
+def test_env_step_retries_a_pending_hold_while_idle():
+    robot = FakeRobot()
+    robot.hold_pending = True
+    step(robot, {"ee_pos": np.zeros(3), "ee_quat": IDENTITY_QUAT, "send_command": False})
+    assert robot.holds == 1 and robot.commands == []
+
+
+def test_stop_zeroes_touch_force_before_holding():
+    import importlib.util
+    import os
+    import sys
+    # scripts/run_agent_component.py の AgentNode._stop_and_hold を、ノードを作らずに呼ぶ
+    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "run_agent_component.py")
+    sys.path.insert(0, os.path.dirname(script))
+    spec = importlib.util.spec_from_file_location("run_agent_component", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls = []
+    node = SimpleNamespace(
+        agent=SimpleNamespace(zero_force=lambda: calls.append("zero_force"),
+                              require_rearm=lambda: calls.append("require_rearm")),
+        robot=SimpleNamespace(hold_measured_pose=lambda: calls.append("hold") or True),
+        get_logger=lambda: SimpleNamespace(error=lambda *a, **k: None),
+    )
+    assert module.AgentNode._stop_and_hold(node)
+    assert calls == ["zero_force", "require_rearm", "hold"]

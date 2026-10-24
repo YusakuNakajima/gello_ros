@@ -415,14 +415,18 @@ class TouchAgent(Agent, Node):
             self._needs_rearm = True
         self._is_teleop_active = False
 
-    def cleanup(self) -> None:
-        """終了時に Touch の力を 0 にする（Touch ドライバは最後に受け取った力を出し続けるため）。"""
+    def zero_force(self) -> None:
+        """Touch の力を 0 にする（Touch ドライバは最後に受け取った力を出し続けるため）。"""
         if not rclpy.ok():
             return
         _, zero_feedback = self._create_zero_wrench_messages()
         for _ in range(3):
             self.force_feedback_pub.publish(zero_feedback)
             time.sleep(0.01)
+
+    def cleanup(self) -> None:
+        """終了時に Touch の力を 0 にする。"""
+        self.zero_force()
 
     def _create_zero_wrench_messages(self) -> Tuple[WrenchStamped, TouchFeedback]:
         """ゼロレンチのメッセージを作成します。"""

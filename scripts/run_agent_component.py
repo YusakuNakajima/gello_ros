@@ -397,6 +397,9 @@ class AgentNode(Node):
     def _stop_and_hold(self) -> bool:
         """速度の上限を掛けずに、いまの計測姿勢を目標にして止める。止められなければ False（エラーを出す）。"""
         # 止めたあとは、白ボタンを離して押し直すまでテレオペを再開しない（入力が戻っても勝手に動き出さない）
+        if getattr(self, 'agent', None) is not None and hasattr(self.agent, 'zero_force'):
+            # Touch の力を先に 0 にする（このあとの保持・保存待ちの間も、最後の力が出続けないように）
+            self.agent.zero_force()
         if getattr(self, 'agent', None) is not None and hasattr(self.agent, 'require_rearm'):
             self.agent.require_rearm()
         if not hasattr(self.robot, 'hold_measured_pose'):

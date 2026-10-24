@@ -332,7 +332,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'skip_initial_move',
-            default_value='false',
+            default_value='true',
             description='Whether to skip initial move to home position'
         ),
         DeclareLaunchArgument(

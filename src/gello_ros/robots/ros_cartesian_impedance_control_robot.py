@@ -80,6 +80,8 @@ class CartesianImpedanceControlRobot(Robot, Node):
         self._last_command_ns = None
         # 直近の指令で実際に送った姿勢（送らなかったら None）。記録用
         self.last_sent_pose = None
+        # 止める（hold_measured_pose）のに失敗し、まだ止められていない。成功するまで移動の指令は出さない
+        self.hold_pending = False
         
         # 安全機能: 最後に有効だったjoint state (position, velocity, effort)
         self._last_valid_joint_positions = None
@@ -391,8 +393,10 @@ class CartesianImpedanceControlRobot(Robot, Node):
                 "The controller keeps the last target (within the tracking-error limit).")
             self._last_command_pose = None
             self.last_sent_pose = None
+            self.hold_pending = True
             return False
         self._publish_pose(measured)
+        self.hold_pending = False
         self._last_command_pose = measured
         self._last_command_ns = self.get_clock().now().nanoseconds
         return True
@@ -402,6 +406,10 @@ class CartesianImpedanceControlRobot(Robot, Node):
 
         joint state が古い・FK に失敗した・目標が無効な場合は送らず、次に送るときは計測姿勢から始め直す。
         """
+        if self.hold_pending:
+            # 前に止めるのに失敗している。新しい計測で止められるまで、移動の指令は出さない
+            self.hold_measured_pose()
+            return
         now_ns = self.get_clock().now().nanoseconds
         measured = self._measured_pose(now_ns)
         if measured is None:
