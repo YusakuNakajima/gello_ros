@@ -446,6 +446,8 @@ class AgentNode(Node):
                 return False
             self.obs = self.env.step(action)
             if update_agent:
+                # Touch の姿勢・ボタンを処理してから act() する（処理しないと Touch が途切れたと判定される）
+                rclpy.spin_once(self.agent, timeout_sec=0.0)
                 self.agent.act(self.obs, force_pose_update=True)
         return True
 

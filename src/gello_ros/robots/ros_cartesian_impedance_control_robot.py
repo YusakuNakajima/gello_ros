@@ -361,12 +361,13 @@ class CartesianImpedanceControlRobot(Robot, Node):
         新しい計測がない（joint state が古い・FK 失敗）場合は送れないので False を返す。
         そのとき controller は最後の目標（計測姿勢から追従誤差の上限以内）を保ち続ける。
         """
-        # 推論などで spin していなかった直後でも止められるよう、新しい joint state を最大 2 周期分待つ
-        deadline_ns = self.get_clock().now().nanoseconds + 2 * self.joint_state_timeout_ns
+        # 推論などで spin していなかった直後でも止められるよう、新しい joint state を最大 2 周期分待つ。
+        # 期限は壁時計（monotonic）で決める。ROS 時刻（use_sim_time で /clock が止まった場合など）だと終わらない
+        deadline_s = time.monotonic() + 2 * self.joint_state_timeout_ns * 1e-9
         while True:
             now_ns = self.get_clock().now().nanoseconds
             measured = self._measured_pose(now_ns)
-            if measured is not None or now_ns > deadline_ns or not rclpy.ok():
+            if measured is not None or time.monotonic() > deadline_s or not rclpy.ok():
                 break
             rclpy.spin_once(self, timeout_sec=0.005)
         measured = normalized_pose(measured) if measured is not None else None
