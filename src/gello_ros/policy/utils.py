@@ -1,4 +1,5 @@
 import os
+import re
 import h5py
 import torch
 import numpy as np
@@ -93,17 +94,17 @@ class EpisodicDataset(torch.utils.data.Dataset):
         is_pad = torch.from_numpy(is_pad).bool()
         
         if self.include_ft:
-            ft_data = torch.from_numpy(ft).float()
-            ft_data = (ft_data - self.norm_stats["ft_mean"]) / self.norm_stats["ft_std"]
+            ft_data = torch.from_numpy(normalize_ft(self.norm_stats, ft)).float()
         else:
             ft_data = []
 
 
         # Return tuple: image data, observation, action, and padding mask
+        observation = normalize_observation(self.norm_stats, observation)
         return image_data, torch.from_numpy(observation).float(), ft_data, action_data, is_pad
 
 
-def get_norm_stats(dataset_dir, num_episodes, include_ft):
+def get_norm_stats(dataset_dir, ids, include_ft):
     """
     各エピソードのHDF5ファイルから、観測とアクションのデータを読み込み、
     各々の平均と標準偏差を計算する。
@@ -114,7 +115,7 @@ def get_norm_stats(dataset_dir, num_episodes, include_ft):
     all_ft_data = []
     all_action_data = []
     
-    for episode_idx in range(num_episodes):
+    for episode_idx in ids:
         dataset_path = os.path.join(dataset_dir, f"episode_{episode_idx}.hdf5")
         with h5py.File(dataset_path, "r") as root:
             # 読み込み: 観測側
@@ -171,10 +172,28 @@ def get_norm_stats(dataset_dir, num_episodes, include_ft):
     return stats
 
 
-def max_episode_length(dataset_dir, num_episodes):
-    """episode_0..num_episodes-1 のうち、最も長いエピソードのステップ数。"""
+EPISODE_FILE = re.compile(r"^episode_(\d+)\.hdf5$")
+
+
+def episode_ids(dataset_dir):
+    """dataset_dir にある episode_<n>.hdf5 の番号（昇順）。保存途中の一時ファイルなどは数えない。"""
+    return sorted(int(m.group(1)) for m in map(EPISODE_FILE.match, os.listdir(dataset_dir)) if m)
+
+
+def normalize_observation(stats, observation):
+    """方策に渡す手先姿勢（位置 + 回転行列）の正規化。学習と推論で同じものを使う。"""
+    return (np.asarray(observation) - stats["obs_mean"]) / stats["obs_std"]
+
+
+def normalize_ft(stats, ft):
+    """方策に渡す力・トルクの正規化。学習と推論で同じものを使う。"""
+    return (np.asarray(ft) - stats["ft_mean"]) / stats["ft_std"]
+
+
+def max_episode_length(dataset_dir, ids):
+    """ids のエピソードのうち、最も長いもののステップ数。"""
     lengths = []
-    for episode_idx in range(num_episodes):
+    for episode_idx in ids:
         with h5py.File(os.path.join(dataset_dir, f"episode_{episode_idx}.hdf5"), "r") as root:
             lengths.append(root["/action/ee_pos"].shape[0])
     return max(lengths)
@@ -186,13 +205,16 @@ def load_data(
     print(f"\nData from: {dataset_dir}\n")
     # obtain train test split
     train_ratio = 0.8
-    shuffled_indices = np.random.permutation(num_episodes)
+    # 実際にある episode_<n>.hdf5 の番号を使う（保存に失敗した番号は欠ける。num_episodes は互換のためだけ）
+    ids = episode_ids(dataset_dir)
+    num_episodes = len(ids)
+    shuffled_indices = np.random.permutation(ids)
     train_indices = shuffled_indices[: int(train_ratio * num_episodes)]
     val_indices = shuffled_indices[int(train_ratio * num_episodes) :]
 
     # obtain normalization stats for qpos and action
-    norm_stats = get_norm_stats(dataset_dir, num_episodes, include_ft)
-    max_episode_len = max_episode_length(dataset_dir, num_episodes)
+    norm_stats = get_norm_stats(dataset_dir, ids, include_ft)
+    max_episode_len = max_episode_length(dataset_dir, ids)
 
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(

@@ -523,8 +523,9 @@ class TouchAgent(Agent, Node):
         if self.teleop_mode == "bilateral":
             # KDLベースのリアルタイム力覚変換を使用
             self.get_logger().debug(f"  - ee_wrench: {np.round(obs['ee_wrench'], 3)}")
-            if {"wrench", "joint_states"} & set(obs.get("stale_sensors", ())):
-                # 古い力、または古い関節角での座標変換（向きを誤る）で返し続けないよう、途切れている間は 0 を返す
+            if {"wrench", "joint_states"} & set(obs.get("stale_sensors", ())) or touch_age_s > self.touch_timeout_s:
+                # 古い力、古い関節角での座標変換（向きを誤る）、または Touch が途切れている（操作者の手元の状態が
+                # 分からない）間は 0 を返す
                 wrench_vis, wrench_feedback = self._create_zero_wrench_messages()
             else:
                 wrench_vis, wrench_feedback = self.transform_wrench_kdl(

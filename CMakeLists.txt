@@ -69,6 +69,9 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_stop_transitions test/test_stop_transitions.py
     APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src
   )
+  ament_add_pytest_test(test_save_episode test/test_save_episode.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
 endif()
 
 ament_package()

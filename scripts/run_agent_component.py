@@ -465,31 +465,38 @@ class AgentNode(Node):
         return True
 
     def save_episode_thread(self, episode_number, obs_replay, action_replay):
-        """Thread function for saving episodes"""
-        save_episode(self, episode_number, obs_replay, action_replay)
+        """Thread function for saving episodes. 失敗は save_episode がログに残し、最終ファイルは作らない"""
+        try:
+            save_episode(self, episode_number, obs_replay, action_replay)
+        except Exception as e:
+            self.get_logger().error(f"Saving episode {episode_number} failed: {e}")
     
     def cleanup(self):
-        """Clean up resources before shutdown"""
-        self.get_logger().info("Starting cleanup...")
-        try:
-            if hasattr(self, 'robot') and self.robot is not None:
-                self.get_logger().info("Stopping robot...")
-                # 終了後も controller は最後の目標を保つので、計測姿勢に合わせてから終わる
-                if rclpy.ok() and hasattr(self.robot, 'hold_measured_pose'):
-                    self.robot.hold_measured_pose()
-                
-            if hasattr(self, 'agent') and self.agent is not None:
-                self.get_logger().info("Cleaning up agent...")
-                if hasattr(self.agent, 'cleanup'):
-                    self.agent.cleanup()
-            
-            if hasattr(self, 'env') and self.env is not None:
-                self.get_logger().info("Destroying RobotEnv node...")
-                self.env.destroy_node()
+        """Clean up resources before shutdown
 
-            self.get_logger().info("Cleanup completed")
-        except Exception as e:
-            self.get_logger().error(f"Error during cleanup: {e}")
+        Touch の力を 0 にする → ロボットを計測姿勢で保持する → ノードを片付ける、の順に、
+        それぞれ別に例外を受ける（前の段で失敗しても、後の段を飛ばさない）。
+        """
+        self.get_logger().info("Starting cleanup...")
+        agent = getattr(self, 'agent', None)
+        robot = getattr(self, 'robot', None)
+        env = getattr(self, 'env', None)
+        steps = []
+        if agent is not None and hasattr(agent, 'cleanup'):
+            # Touch ドライバは最後の力を出し続けるので、ほかの何よりも先に 0 にする
+            steps.append(("Cleaning up agent (zero Touch force)", agent.cleanup))
+        if robot is not None and hasattr(robot, 'hold_measured_pose'):
+            # 終了後も controller は最後の目標を保つので、計測姿勢に合わせてから終わる
+            steps.append(("Stopping robot", lambda: rclpy.ok() and robot.hold_measured_pose()))
+        if env is not None:
+            steps.append(("Destroying RobotEnv node", env.destroy_node))
+        for label, step in steps:
+            self.get_logger().info(f"{label}...")
+            try:
+                step()
+            except Exception as e:
+                self.get_logger().error(f"Error during cleanup ({label}): {e}")
+        self.get_logger().info("Cleanup completed")
 
         
     def run(self):

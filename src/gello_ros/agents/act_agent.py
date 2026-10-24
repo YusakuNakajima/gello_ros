@@ -6,6 +6,7 @@ import rclpy
 from rclpy.node import Node
 import torch
 from gello_ros.agents.agent import Agent
+from gello_ros.policy.utils import normalize_ft, normalize_observation
 from scipy.spatial.transform import Rotation as R
 
 class ACTAgent(Agent, Node):
@@ -57,7 +58,8 @@ class ACTAgent(Agent, Node):
 
         # Preprocess and postprocess lambdas
         self.pre_process = (
-            lambda s_qpos: (s_qpos - self.stats["obs_mean"]) / self.stats["obs_std"]
+            # 学習（EpisodicDataset）と同じ正規化
+            lambda s_qpos: normalize_observation(self.stats, s_qpos)
         )
         self.post_process = (
             lambda a: a * self.stats["action_std"] + self.stats["action_mean"]

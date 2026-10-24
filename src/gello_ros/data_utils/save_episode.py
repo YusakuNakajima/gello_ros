@@ -82,9 +82,26 @@ def save_episode(node: Node, episode_number: int, obs_replay: List[Dict], action
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
     dataset_path = os.path.join(data_dir, f"episode_{episode_number}.hdf5")
+    # 一時ファイルに書き切ってから最終名にする。途中で失敗したファイルが、学習用の完成したエピソードとして残らないように
+    tmp_path = os.path.join(data_dir, f".episode_{episode_number}.hdf5.tmp")
 
     max_timesteps = len(obs_replay)
     print(data_dict.keys())
+    try:
+        _write_episode(tmp_path, data_dict, camera_names, cam_height, cam_width, max_timesteps,
+                       use_FT_sensor, wrench_dim, node)
+        os.replace(tmp_path, dataset_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        node.get_logger().error(f"エピソード {episode_number} の保存に失敗しました（{dataset_path} は作っていません）。")
+        raise
+
+    node.get_logger().info(f"データを {dataset_path} に正常に保存しました。")
+
+
+def _write_episode(dataset_path, data_dict, camera_names, cam_height, cam_width, max_timesteps,
+                   use_FT_sensor, wrench_dim, node):
     with h5py.File(dataset_path, "w", rdcc_nbytes=1024**2 * 2) as root:
         # このレコーダは obs[t] から計算した action を同じ index t に保存する。policy/utils.py はこの対応を
         # action_alignment で読む（以前は、ACT 由来の attrs["sim"] がこの対応を表していた）
@@ -123,8 +140,6 @@ def save_episode(node: Node, episode_number: int, obs_replay: List[Dict], action
         # データを書き込み
         for name, data in data_dict.items():
             root[name][...] = np.array(data)
-
-    node.get_logger().info(f"データを {dataset_path} に正常に保存しました。")
 
 
 # --- 使用例 ---

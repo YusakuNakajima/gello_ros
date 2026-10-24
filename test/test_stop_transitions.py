@@ -177,3 +177,52 @@ def test_stop_zeroes_touch_force_before_holding():
     )
     assert module.AgentNode._stop_and_hold(node)
     assert calls == ["zero_force", "require_rearm", "hold"]
+
+
+def load_runner():
+    import importlib.util
+    import os
+    import sys
+    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "run_agent_component.py")
+    sys.path.insert(0, os.path.dirname(script))
+    spec = importlib.util.spec_from_file_location("run_agent_component", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_cleanup_zeroes_force_first_and_continues_after_a_failing_hold(monkeypatch):
+    module = load_runner()
+    monkeypatch.setattr(module.rclpy, "ok", lambda: True)
+    calls = []
+
+    def failing_hold():
+        calls.append("hold")
+        raise RuntimeError("hold failed")
+    node = SimpleNamespace(
+        agent=SimpleNamespace(cleanup=lambda: calls.append("agent.cleanup")),
+        robot=SimpleNamespace(hold_measured_pose=failing_hold),
+        env=SimpleNamespace(destroy_node=lambda: calls.append("env.destroy")),
+        get_logger=lambda: SimpleNamespace(info=lambda *a, **k: None, error=lambda *a, **k: None),
+    )
+    module.AgentNode.cleanup(node)
+    assert calls == ["agent.cleanup", "hold", "env.destroy"]
+
+
+def test_stale_touch_sends_zero_feedback_even_if_robot_sensors_are_fresh():
+    agent = fake_touch_agent()
+    agent.teleop_mode = "bilateral"
+    agent._is_teleop_active = True
+    agent._touch_received_ns = monotonic_ns() - 1_000_000_000  # Touch の姿勢が 1 s 途切れている
+    agent.touch_timeout_s = 0.1
+    from geometry_msgs.msg import WrenchStamped
+    from touch_msgs.msg import TouchFeedback
+    zero = (WrenchStamped(), TouchFeedback())
+    agent._create_zero_wrench_messages = lambda: zero
+    agent.transform_wrench_kdl = lambda *a: (_ for _ in ()).throw(AssertionError("must not send real force"))
+    sent = []
+    agent.force_feedback_pub = SimpleNamespace(publish=sent.append)
+    agent.force_feedback_vis_pub = SimpleNamespace(publish=lambda m: None)
+    obs = dict(obs_at(0.4), ee_wrench=np.array([5.0, 0, 0, 0, 0, 0]))
+    TouchAgent.act(agent, obs)
+    assert len(sent) == 1 and sent[0] is zero[1]
