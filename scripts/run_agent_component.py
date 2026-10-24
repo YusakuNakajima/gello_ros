@@ -25,6 +25,7 @@ from gello_ros.data_utils.save_episode import save_episode
 from gello_ros.env import RobotEnv
 from gello_ros.robots.robot import PrintRobot
 from gello_ros.policy.utils import *
+from gello_ros.deadline_call import call_with_deadline, DONE, TIMEOUT
 
 import rclpy
 from rclpy.node import Node
@@ -117,6 +118,11 @@ class AgentNode(Node):
         self.declare_parameter("home_move_timeout_s", 15.0)
         self.declare_parameter("home_position_tolerance_m", 0.005)
         self.declare_parameter("home_orientation_tolerance_rad", 0.05)
+        # 方策の推論 1 回の制限時間（ms）。過ぎたらその場で止めて終了する（controller は最後の目標を保つので、
+        # 推論が戻らない間もロボットは止まらない）。暫定の推測値（2026-10-24、模擬HWのみ。この GPU では最大 13.5 ms）
+        self.declare_parameter("policy_inference_timeout_ms", 200.0)
+        # 最初の 1 回（GPU の初期化を含む、結果は捨てる）の制限時間（s）。暫定の推測値
+        self.declare_parameter("policy_warmup_timeout_s", 60.0)
 
     def get_parameters(self):
         """Get all parameters from ROS2 parameter server"""
@@ -143,6 +149,10 @@ class AgentNode(Node):
         self.home_move_timeout_s = self.get_parameter("home_move_timeout_s").get_parameter_value().double_value
         self.home_position_tolerance_m = self.get_parameter("home_position_tolerance_m").get_parameter_value().double_value
         self.home_orientation_tolerance_rad = self.get_parameter("home_orientation_tolerance_rad").get_parameter_value().double_value
+        self.policy_inference_timeout_s = self.get_parameter("policy_inference_timeout_ms").get_parameter_value().double_value * 1e-3
+        self.policy_warmup_timeout_s = self.get_parameter("policy_warmup_timeout_s").get_parameter_value().double_value
+        if not all(np.isfinite(v) and v > 0.0 for v in (self.policy_inference_timeout_s, self.policy_warmup_timeout_s)):
+            raise ValueError("policy_inference_timeout_ms and policy_warmup_timeout_s must be finite values > 0")
         
         # Mock is hardcoded to False for now
         self.mock = False
@@ -420,6 +430,25 @@ class AgentNode(Node):
                 "use the emergency stop if the robot keeps moving.")
         return held
 
+    def _policy_act(self, obs, t, timeout_s):
+        """方策の推論を別スレッドで動かし、timeout_s（s）以内に戻れば指令を返す。
+
+        期限を過ぎた・待つ間に終了要求を受けた場合は、その場で止めて None を返す（呼び出し元は終了する）。
+        期限を過ぎた推論は捨てる（スレッドは止められないので、終わっても結果を使わない）。
+        """
+        result = call_with_deadline(lambda: self.agent.act(obs, t), timeout_s, should_abort=self._stop_requested)
+        # 推論が終わったのと同時に終了要求を受けていても、計算した指令は送らない
+        if result.status == DONE and not self._stop_requested():
+            return result.value
+        if result.status == TIMEOUT:
+            self.get_logger().error(
+                f"Policy inference did not return within {timeout_s * 1e3:g} ms (step {t}); "
+                "stopping the policy and holding the measured pose.")
+        else:
+            self.get_logger().info("Stop requested during inference; holding the measured pose.")
+        self._stop_and_hold()
+        return None
+
     def _stop_requested(self) -> bool:
         """SIGINT/SIGTERM、または /GUI_button の quit を受けたか（AgentNode のコールバックを処理してから判定）。"""
         rclpy.spin_once(self, timeout_sec=0.0)
@@ -532,7 +561,9 @@ class AgentNode(Node):
                         break
                     # 1 回目の推論は GPU の初期化で遅く、その間に画像の期限が切れる。結果を捨てる推論を
                     # 先に 1 回してから、観測を取り直して始める（t=0 でもう一度推論し直すので、結果は使われない）
-                    self.agent.act(self.obs, 0)
+                    if self._policy_act(self.obs, 0, self.policy_warmup_timeout_s) is None:
+                        self.shutdown_requested = True
+                        break
                     self.obs = self.env.wait_for_fresh_inputs()
                     for t in range(self.number_of_steps):
                         time_passed = time.time() - start_time
@@ -549,11 +580,9 @@ class AgentNode(Node):
                             self._stop_and_hold()
                             self.shutdown_requested = True
                             break
-                        action = self.agent.act(self.obs, t)
-                        if self._stop_requested():
-                            # 推論中に終了要求を受けた。計算した指令は送らない
-                            self.get_logger().info("Stop requested during inference; holding the measured pose.")
-                            self._stop_and_hold()
+                        # 推論が期限内に戻らない・推論中に終了要求を受けたら、計算中の指令は送らずに止める
+                        action = self._policy_act(self.obs, t, self.policy_inference_timeout_s)
+                        if action is None:
                             self.shutdown_requested = True
                             break
                         stale_now = self.env.stale_now(self.obs)
