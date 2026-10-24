@@ -151,10 +151,11 @@ class RobotEnv(Node):
         return 0
 
     def step(self, action: Dict[str, np.ndarray]) -> Dict[str, Any]:
-        if action.get("hold_measured", False):
+        if action.get("hold_measured", False) and hasattr(self._robot, "hold_measured_pose"):
             # 止めるとき: 速度の上限を掛けずに、いまの計測姿勢を目標にする
             self._robot.hold_measured_pose()
         elif self._control_mode == "cartesian":
+            # hold_measured_pose のないロボット（指令ガードなしの他のcontroller）は、従来どおり action の姿勢を送る
             # Ensure keys exist before accessing
             if "ee_pos" in action and "ee_quat" in action:
                 pos_quat = np.concatenate([action["ee_pos"], action["ee_quat"]])

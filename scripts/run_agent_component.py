@@ -103,6 +103,8 @@ class AgentNode(Node):
         self.declare_parameter("task_name", "default")
         self.declare_parameter("robot_description", "")
         # 方策の実行・エピソードの記録の前にホーム姿勢（robot_home_pose_with_touch）へ動かすか
+        # エピソードの hdf5 に残す、記録したハードウェア（"real" / "fake" など）。後から実機と模擬を区別するため
+        self.declare_parameter("hardware_label", "unspecified")
         self.declare_parameter("move_home_before_run", True)
         # ホーム姿勢への移動の制限時間（s）と、到達とみなす差（m、rad）。暫定の推測値（模擬HWでのみ確認）
         self.declare_parameter("home_move_timeout_s", 15.0)
@@ -388,10 +390,16 @@ class AgentNode(Node):
         if self.obs is None:
             self.obs = self.env.get_obs()
 
-    def _stop_and_hold(self):
-        """速度の上限を掛けずに、いまの計測姿勢を目標にして止める。"""
-        if hasattr(self.robot, 'hold_measured_pose'):
-            self.robot.hold_measured_pose()
+    def _stop_and_hold(self) -> bool:
+        """速度の上限を掛けずに、いまの計測姿勢を目標にして止める。止められなければ False（エラーを出す）。"""
+        if not hasattr(self.robot, 'hold_measured_pose'):
+            return False
+        held = self.robot.hold_measured_pose()
+        if not held:
+            self.get_logger().error(
+                "Could not hold the measured pose (no fresh joint state). The controller keeps its last target; "
+                "use the emergency stop if the robot keeps moving.")
+        return held
 
     def _stop_requested(self) -> bool:
         """SIGINT/SIGTERM、または /GUI_button の quit を受けたか（AgentNode のコールバックを処理してから判定）。"""
@@ -511,6 +519,12 @@ class AgentNode(Node):
                             self.shutdown_requested = True
                             break
                         action = self.agent.act(self.obs, t)
+                        if self._stop_requested():
+                            # 推論中に終了要求を受けた。計算した指令は送らない
+                            self.get_logger().info("Stop requested during inference; holding the measured pose.")
+                            self._stop_and_hold()
+                            self.shutdown_requested = True
+                            break
                         stale_now = self.env.stale_now(self.obs)
                         if stale_now:
                             # 方策の計算中に入力の期限が切れた。古い観測から作った指令は送らない
@@ -570,6 +584,13 @@ class AgentNode(Node):
                                 episode_aborted = True
                                 break
                             action = self.agent.act(self.obs)
+                            rclpy.spin_once(self, timeout_sec=0.0)  # act() 中に届いた /GUI_button を処理する
+                            if SHUTDOWN_SIGNALLED.is_set() or self.button_state == "quit":
+                                # 計算した指令は送らずに止める。quit ならここまでを保存して終了、シグナルなら捨てる
+                                self.get_logger().info("Stop requested during act(); holding the measured pose.")
+                                self._stop_and_hold()
+                                episode_aborted = SHUTDOWN_SIGNALLED.is_set()
+                                break
                             stale_now = self.env.stale_now(self.obs)
                             if stale_now:
                                 # act() の計算中に入力の期限が切れた

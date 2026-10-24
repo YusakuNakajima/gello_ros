@@ -86,7 +86,11 @@ def save_episode(node: Node, episode_number: int, obs_replay: List[Dict], action
     max_timesteps = len(obs_replay)
     print(data_dict.keys())
     with h5py.File(dataset_path, "w", rdcc_nbytes=1024**2 * 2) as root:
-        root.attrs["sim"] = True
+        # このレコーダは obs[t] から計算した action を同じ index t に保存する。policy/utils.py はこの対応を
+        # action_alignment で読む（以前は、ACT 由来の attrs["sim"] がこの対応を表していた）
+        root.attrs["action_alignment"] = "same_step"
+        root.attrs["sim"] = True  # 古い読み込み側との互換のためだけに残す。模擬かどうかは "hardware" を見る
+        root.attrs["hardware"] = node.get_parameter("hardware_label").get_parameter_value().string_value
         obs = root.create_group("observations")
         image = obs.create_group("images")
         action = root.create_group("action")

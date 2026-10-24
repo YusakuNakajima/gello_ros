@@ -31,6 +31,8 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
         with h5py.File(dataset_path, "r") as root:
             is_sim = root.attrs["sim"]
+            # action と観測の index の対応。新しいファイルは action_alignment、古いファイルは sim で判定する
+            same_step = (root.attrs["action_alignment"] == "same_step") if "action_alignment" in root.attrs else bool(is_sim)
             episode_len = root["/action/ee_pos"].shape[0]
 
             if sample_full_episode:
@@ -53,7 +55,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 ft = root["/observations/wrench"][start_ts]
                 
             # Build action by concatenating /action/ee_pos and flattened /observations/ee_rot_matrix over timesteps
-            if is_sim:
+            if same_step:
                 act_ee_pos = root["/action/ee_pos"][start_ts:]
                 act_rot = root["/action/ee_rot_matrix"][start_ts:]
                 action_len = episode_len - start_ts
