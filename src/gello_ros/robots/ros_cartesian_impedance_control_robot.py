@@ -119,9 +119,11 @@ class CartesianImpedanceControlRobot(Robot, Node):
         # Call zero reset service
         self.get_logger().info("Zero reset feedback FT sensor offset")
         future = self.feedback_wrench_zero_client.call_async(Empty.Request())
-        rclpy.spin_until_future_complete(self, future)
-        if future.result() is None:
-            self.get_logger().error("Failed to call feedback wrench zero service")
+        # 応答が来ないと初期化が終わらないので、期限を付ける（再試行はしない）
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        if not future.done() or future.result() is None:
+            self.get_logger().error("Feedback wrench zero service did not respond within 5 s")
+            raise TimeoutError("Wrench zero service response timeout")
         time.sleep(1)
 
         
@@ -280,6 +282,12 @@ class CartesianImpedanceControlRobot(Robot, Node):
 
     def wrench_callback(self, msg: WrenchStamped):
         """Wrench feedback callback"""
+        values = [msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z,
+                  msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z]
+        if not np.all(np.isfinite(values)):
+            # NaN/Inf は受け取らない（受信時刻も更新しない）。続くと古い入力として扱われ、記録・方策の実行が止まる
+            self.get_logger().warn("Wrench has a non-finite value; ignoring it.", throttle_duration_sec=5)
+            return
         stamp_ns = stamp_to_ns(msg.header.stamp)
         if stamp_went_backwards(self._wrench_stamp_ns, stamp_ns):
             self.get_logger().warn("Wrench stamp went backwards; ignoring it.", throttle_duration_sec=5)
@@ -361,15 +369,19 @@ class CartesianImpedanceControlRobot(Robot, Node):
         新しい計測がない（joint state が古い・FK 失敗）場合は送れないので False を返す。
         そのとき controller は最後の目標（計測姿勢から追従誤差の上限以内）を保ち続ける。
         """
-        # 推論などで spin していなかった直後でも止められるよう、新しい joint state を最大 2 周期分待つ。
-        # 期限は壁時計（monotonic）で決める。ROS 時刻（use_sim_time で /clock が止まった場合など）だと終わらない
+        # 止めると決めた後に届いた joint state だけを使う。手元の値（最大 joint_state_timeout_ms 前）は、
+        # その後ロボットが動いていると、速度の上限なしで後ろへ引き戻す目標になる。
+        # 待つのは最大 2 × joint_state_timeout_ms。期限は壁時計（monotonic）で決める
+        #（ROS 時刻は use_sim_time で /clock が止まると進まない）
+        requested_ns = monotonic_ns()
         deadline_s = time.monotonic() + 2 * self.joint_state_timeout_ns * 1e-9
-        while True:
-            now_ns = self.get_clock().now().nanoseconds
-            measured = self._measured_pose(now_ns)
-            if measured is not None or time.monotonic() > deadline_s or not rclpy.ok():
-                break
+        measured = None
+        while rclpy.ok() and time.monotonic() <= deadline_s:
             rclpy.spin_once(self, timeout_sec=0.005)
+            if self._joint_state_received_ns is not None and self._joint_state_received_ns > requested_ns:
+                now_ns = self.get_clock().now().nanoseconds
+                measured = self._measured_pose(now_ns)
+                break
         measured = normalized_pose(measured) if measured is not None else None
         if measured is None:
             self.get_logger().error(

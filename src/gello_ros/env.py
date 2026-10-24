@@ -5,7 +5,7 @@ from functools import partial
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 
 from gello_ros.robots.robot import Robot
@@ -109,7 +109,9 @@ class RobotEnv(Node):
                 Image,
                 topic_name,
                 partial(self._camera_color_callback, camera_name),
-                qos_profile_sensor_data,
+                # 最新の 1 枚だけを持つ。sensor_data の depth 5 だと、spin しない時間（推論など）のあと
+                # 溜まっていた古い画像から順に処理され、観測が期限ぎりぎりの画像になる
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST),
             )
             self.get_logger().info(f"Subscribed to {topic_name} in RobotEnv")
         
@@ -171,7 +173,7 @@ class RobotEnv(Node):
     
     def stale_now(self, obs: Dict[str, Any]) -> List[str]:
         """obs の入力のうち、今の時点で sensor_timeout_ms を超えたものの名前（観測を作ってからの経過時間を足す）。"""
-        elapsed_s = (self.get_clock().now().nanoseconds - obs["obs_time_ns"]) * 1e-9
+        elapsed_s = (monotonic_ns() - obs["obs_monotonic_ns"]) * 1e-9
         stale = [name for name, age_s in obs["sensor_ages_s"].items() if age_s + elapsed_s > self.sensor_timeout_s]
         return stale + [name for name in obs["stale_sensors"] if name not in stale]
 
@@ -236,7 +238,8 @@ class RobotEnv(Node):
             stale.append("joint_states")
         observations["stale_sensors"] = stale
         # 観測を作った時刻と各入力の古さ。方策の計算中に期限が切れていないかを、送る直前に stale_now() で確かめる
-        observations["obs_time_ns"] = now_ns
+        # 経過時間は壁時計で測る（ROS 時刻は止まったり戻ったりする）
+        observations["obs_monotonic_ns"] = monotonic_ns()
         observations["sensor_ages_s"] = ages_s
         
         # Ensure essential keys are present

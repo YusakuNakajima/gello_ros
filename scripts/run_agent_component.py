@@ -623,6 +623,14 @@ class AgentNode(Node):
                                 break
                             self.button_state = "pass"
                             continue
+                        if not obs_replay:
+                            # 1 ステップも記録しないうちに quit した。空のエピソードは保存も番号付けもしない
+                            self.get_logger().info("No steps recorded; not saving an episode.")
+                            if self.button_state == "quit":
+                                self.shutdown_requested = True
+                                break
+                            self.button_state = "pass"
+                            continue
                         self.get_logger().info("Episode done, saving now")
                         current_save_thread = threading.Thread(target=self.save_episode_thread, args=(current_episode_number, obs_replay, action_replay))
                         current_save_thread.start()
