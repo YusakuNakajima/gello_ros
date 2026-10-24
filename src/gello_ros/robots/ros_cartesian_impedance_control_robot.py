@@ -5,7 +5,7 @@ from scipy.spatial.transform import Rotation as R
 
 from gello_ros.robots.robot import Robot
 from gello_ros.robots.pose_command_guard import PoseCommandLimits, limit_pose_command, normalized_pose
-from gello_ros.freshness import input_age_s, stamp_to_ns, stamp_went_backwards
+from gello_ros.freshness import input_age_s, monotonic_ns, stamp_to_ns, stamp_went_backwards
 
 import rclpy
 from rclpy.node import Node
@@ -68,11 +68,11 @@ class CartesianImpedanceControlRobot(Robot, Node):
         self._joint_positions = None
         self._joint_velocities = None
         self._joint_efforts = None
-        # joint state を最後に受信した時刻と、その header.stamp（どちらも ROS 時刻、ns）。
+        # joint state を最後に受信した時刻（monotonic、ns）と、その header.stamp（ROS 時刻、ns）。
         # 古い計測で指令を出さないために使う。stamp が 0 のメッセージは受信時刻だけで判定する
         self._joint_state_received_ns = None
         self._joint_state_stamp_ns = None
-        # 力センサの値を最後に受信した時刻と、その header.stamp（ROS 時刻、ns）。観測に「何秒前の値か」を載せる
+        # 力センサの値を最後に受信した時刻（monotonic、ns）と、その header.stamp（ROS 時刻、ns）。観測に「何秒前の値か」を載せる
         self._wrench_received_ns = None
         self._wrench_stamp_ns = None
         # 最後に送った指令姿勢と、その時刻（ROS 時刻、ns）
@@ -271,7 +271,7 @@ class CartesianImpedanceControlRobot(Robot, Node):
         self._joint_positions = ordered_pos
         self._joint_velocities = ordered_vel
         self._joint_efforts = ordered_eff
-        self._joint_state_received_ns = self.get_clock().now().nanoseconds
+        self._joint_state_received_ns = monotonic_ns()
         self._joint_state_stamp_ns = stamp_ns
 
         self._last_valid_joint_positions = self._joint_positions.copy()
@@ -285,7 +285,7 @@ class CartesianImpedanceControlRobot(Robot, Node):
             self.get_logger().warn("Wrench stamp went backwards; ignoring it.", throttle_duration_sec=5)
             return
         self._wrench = msg
-        self._wrench_received_ns = self.get_clock().now().nanoseconds
+        self._wrench_received_ns = monotonic_ns()
         self._wrench_stamp_ns = stamp_ns
 
     def num_dofs(self) -> int:

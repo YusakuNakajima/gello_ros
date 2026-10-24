@@ -9,7 +9,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 from gello_ros.robots.robot import Robot
-from gello_ros.freshness import input_age_s, stamp_to_ns, stamp_went_backwards
+from gello_ros.freshness import input_age_s, monotonic_ns, stamp_to_ns, stamp_went_backwards
 
 
 def image_msg_to_numpy(msg: Image) -> np.ndarray:
@@ -88,7 +88,7 @@ class RobotEnv(Node):
         # Camera handling - Zero-copy mode
         self.camera_names = camera_names
         self.camera_images = {}  # Store Image messages directly for zero-copy
-        # カメラごとに最後に画像を受信した時刻と、その header.stamp（ROS 時刻、ns）
+        # カメラごとに最後に画像を受信した時刻（monotonic、ns）と、その header.stamp（ROS 時刻、ns）
         self.camera_received_ns = {}
         self.camera_stamp_ns = {}
         # 画像・力センサの値がこれより古ければ、観測の stale_sensors に名前を入れる（ms）
@@ -136,7 +136,7 @@ class RobotEnv(Node):
             self.get_logger().warn(f"{camera_name}: image stamp went backwards; ignoring it.", throttle_duration_sec=5)
             return
         self.camera_images[camera_name] = msg
-        self.camera_received_ns[camera_name] = self.get_clock().now().nanoseconds
+        self.camera_received_ns[camera_name] = monotonic_ns()
         self.camera_stamp_ns[camera_name] = stamp_ns
 
     def robot(self) -> Robot:
@@ -191,7 +191,11 @@ class RobotEnv(Node):
         """Get observation from the environment."""
         # Only spin robot node to update robot states
         # Camera updates are handled by the main spin loop in component mode
+        # spin_once は 1 回に 1 つのコールバックしか処理しない。高い周期の力センサ（~1 kHz）の間に
+        # joint state（30 Hz など）が処理されないまま古くなるので、待っているもの（各 depth 1）を何回か処理する
         rclpy.spin_once(self._robot, timeout_sec=0.001)
+        for _ in range(3):
+            rclpy.spin_once(self._robot, timeout_sec=0.0)
         rclpy.spin_once(self, timeout_sec=0.0001) # Process camera callbacks
 
         observations = {}

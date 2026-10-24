@@ -12,7 +12,7 @@ from touch_msgs.msg import TouchButtonEvent, TouchFeedback
 
 import tf2_ros
 from gello_ros.agents.agent import Agent
-from gello_ros.freshness import input_age_s, stamp_to_ns, stamp_went_backwards
+from gello_ros.freshness import input_age_s, monotonic_ns, stamp_to_ns, stamp_went_backwards
 from kdl_parser_py.kdl_helper import KDLHelper
 
 # tf2_geometry_msgsはPoseやWrenchの変換に便利ですが、
@@ -64,7 +64,7 @@ class TouchAgent(Agent, Node):
         self._is_teleop_active = False  # 白ボタンが押されているか
         self._was_teleop_active = False # 前のステップで白ボタンが押されていたか
         self._is_z_lock_active = False  # 灰ボタンが押されているか
-        # Touch の姿勢を最後に受信した時刻と header.stamp（ROS 時刻、ns）。ドライバが止まったことを検出する
+        # Touch の姿勢を最後に受信した時刻（monotonic、ns）と header.stamp（ROS 時刻、ns）。ドライバが止まったことを検出する
         self._touch_received_ns: int | None = None
         self._touch_stamp_ns: int | None = None
         # Touch が途切れたあとは、白ボタンをいったん離すまでテレオペを再開しない
@@ -320,7 +320,7 @@ class TouchAgent(Agent, Node):
         if stamp_went_backwards(self._touch_stamp_ns, stamp_ns):
             self.get_logger().warn("Touch pose stamp went backwards; ignoring it.", throttle_duration_sec=5)
             return
-        self._touch_received_ns = self.get_clock().now().nanoseconds
+        self._touch_received_ns = monotonic_ns()
         self._touch_stamp_ns = stamp_ns
 
         # 有効なquaternionを正規化
@@ -409,6 +409,12 @@ class TouchAgent(Agent, Node):
             self.get_logger().error(f"KDL力覚変換エラー: {e}")
             return self._create_zero_wrench_messages()
 
+    def require_rearm(self) -> None:
+        """テレオペを止め、白ボタンを離して押し直すまで再開しないようにする（止める処理のあとに呼ぶ）。"""
+        if self._is_teleop_active:
+            self._needs_rearm = True
+        self._is_teleop_active = False
+
     def cleanup(self) -> None:
         """終了時に Touch の力を 0 にする（Touch ドライバは最後に受け取った力を出し続けるため）。"""
         if not rclpy.ok():
@@ -492,6 +498,10 @@ class TouchAgent(Agent, Node):
                 f"Touch pose is {touch_age_s:.3f} s old; stopping teleop until the white button is released and pressed again.")
             self._is_teleop_active = False
             self._needs_rearm = True
+        if "joint_states" in obs.get("stale_sensors", ()) and self._is_teleop_active:
+            # ロボットの計測が途切れた。戻ったときに押したままの状態で動き出さないよう、押し直すまで止める
+            self.get_logger().error("Joint states are stale; stopping teleop until the white button is pressed again.")
+            self.require_rearm()
         if self.pose_static_transform is None:
             # touch_base -> robot_base のTFがないと Touch の動きをロボット座標に移せない。
             # Z固定（灰ボタン）の姿勢上書きも含めて、テレオペを無効にする

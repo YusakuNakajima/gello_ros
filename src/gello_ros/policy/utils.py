@@ -12,8 +12,11 @@ e = IPython.embed
 
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, include_ft):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, include_ft, max_episode_len=None):
         super(EpisodicDataset, self).__init__()
+        # action と padding mask をこの長さに揃える（quit で途中保存したエピソードと混ぜても batch にできるよう、
+        # データセット中で最も長いエピソードの長さ）。None なら各エピソード自身の長さ（以前の動作）
+        self.max_episode_len = max_episode_len
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
@@ -69,12 +72,12 @@ class EpisodicDataset(torch.utils.data.Dataset):
         # Concatenate along the second axis (flatten rot matrix for each timestep)
         action = np.concatenate((act_ee_pos, act_rot.reshape(act_rot.shape[0], -1)), axis=1)
 
-        # Pad action to the original shape if needed
-        original_action_shape = (episode_len, action.shape[1])
-        padded_action = np.zeros(original_action_shape, dtype=np.float32)
+        # Pad action to a common length so episodes of different lengths can be batched
+        padded_len = self.max_episode_len if self.max_episode_len is not None else episode_len
+        padded_action = np.zeros((padded_len, action.shape[1]), dtype=np.float32)
         padded_action[:action_len] = action
 
-        is_pad = np.zeros(episode_len)
+        is_pad = np.zeros(padded_len)
         is_pad[action_len:] = 1
 
         # Stack images from different cameras
@@ -168,6 +171,15 @@ def get_norm_stats(dataset_dir, num_episodes, include_ft):
     return stats
 
 
+def max_episode_length(dataset_dir, num_episodes):
+    """episode_0..num_episodes-1 のうち、最も長いエピソードのステップ数。"""
+    lengths = []
+    for episode_idx in range(num_episodes):
+        with h5py.File(os.path.join(dataset_dir, f"episode_{episode_idx}.hdf5"), "r") as root:
+            lengths.append(root["/action/ee_pos"].shape[0])
+    return max(lengths)
+
+
 def load_data(
     dataset_dir, num_episodes, camera_names, include_ft, batch_size_train, batch_size_val
 ):
@@ -180,12 +192,15 @@ def load_data(
 
     # obtain normalization stats for qpos and action
     norm_stats = get_norm_stats(dataset_dir, num_episodes, include_ft)
+    max_episode_len = max_episode_length(dataset_dir, num_episodes)
 
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(
-        train_indices, dataset_dir, camera_names, norm_stats, include_ft
+        train_indices, dataset_dir, camera_names, norm_stats, include_ft, max_episode_len
     )
-    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, include_ft)
+    val_dataset = EpisodicDataset(
+        val_indices, dataset_dir, camera_names, norm_stats, include_ft, max_episode_len
+    )
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,

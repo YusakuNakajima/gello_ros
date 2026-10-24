@@ -202,6 +202,7 @@ class AgentNode(Node):
                     )
         except Exception as e:
             self.get_logger().fatal(f"Failed to initialize robot, shutting down. Error: {e}")
+            self.cleanup()
             sys.exit(1)
 
     def initialize_agent(self):
@@ -362,6 +363,9 @@ class AgentNode(Node):
                 raise ValueError("Invalid agent type: %s" % self.agent_type)
         except Exception as e:
             self.get_logger().fatal(f"Failed to initialize agent, shutting down. Error: {e}")
+            # 初期化の途中（ホーム姿勢への移動など）で失敗しても、姿勢の保持と Touch の力 0 を済ませてから終わる。
+            # コンストラクタが終わらないので、main の cleanup は呼ばれない
+            self.cleanup()
             sys.exit(1)
     
     # Images are now handled by RobotEnv with zero-copy - no need for separate _add_images_to_obs
@@ -384,7 +388,7 @@ class AgentNode(Node):
         # Move the robot to the configured home pose if not skipping
         if not self.skip_initial_move:
             if not self._move_home(update_agent=True):
-                raise RuntimeError("Inputs went stale during the initial move to the home pose")
+                raise RuntimeError("The initial move to the home pose stopped (timeout, stale inputs or stop request)")
 
         # skip_initial_move のときも、ループの最初の act() に観測を渡せるようにする
         if self.obs is None:
@@ -392,6 +396,9 @@ class AgentNode(Node):
 
     def _stop_and_hold(self) -> bool:
         """速度の上限を掛けずに、いまの計測姿勢を目標にして止める。止められなければ False（エラーを出す）。"""
+        # 止めたあとは、白ボタンを離して押し直すまでテレオペを再開しない（入力が戻っても勝手に動き出さない）
+        if getattr(self, 'agent', None) is not None and hasattr(self.agent, 'require_rearm'):
+            self.agent.require_rearm()
         if not hasattr(self.robot, 'hold_measured_pose'):
             return False
         held = self.robot.hold_measured_pose()
